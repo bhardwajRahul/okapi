@@ -732,6 +732,7 @@ Check out **[Goma Gateway](https://github.com/jkaninda/goma-gateway)** a high-pe
 
 - **[Posta](https://github.com/goposta/posta)** — Self-hosted email delivery platform. Send emails via HTTP API with SMTP delivery, templates, storage, and analytics.
 - **[Goma Admin](https://github.com/jkaninda/goma-admin)** — Control plane for Goma Gateway. Manage, configure, and monitor distributed API gateways from a unified dashboard.
+- **[Miabi](https://github.com/miabi-io/miabi)** — Open-source, self-hosted PaaS. Deploy containerized apps from Git, Docker images, or templates with builds, domains, SSL, databases, backups, and monitoring built in.
 
 
 ## Okapi vs Huma
