@@ -3,6 +3,7 @@ package okapi
 import (
 	"bytes"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -39,6 +40,38 @@ func serveSPARequest(o *Okapi, target string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	o.ServeHTTP(rec, req)
 	return rec
+}
+
+func TestWebRoutesFlowThroughAccessLog(t *testing.T) {
+	dir := writeSPAFixture(t)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	o := New()
+	o.WithLogger(logger)
+	o.Static("/static", dir)
+	o.Web("/", dir)
+
+	// Real asset served by Web, a Web index fallback, and a Static file should
+	// all produce an access log entry, just like regular routes.
+	cases := []struct {
+		name, target string
+	}{
+		{"web asset", "/assets/app.js"},
+		{"web index fallback", "/login"},
+		{"static file", "/static/favicon.ico"},
+	}
+	for _, tc := range cases {
+		buf.Reset()
+		rec := serveSPARequest(o, tc.target)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", tc.name, rec.Code)
+		}
+		if !strings.Contains(buf.String(), "[okapi] Incoming request") {
+			t.Fatalf("%s: expected access log entry, got %q", tc.name, buf.String())
+		}
+	}
 }
 
 func TestSPAServesRealFile(t *testing.T) {
