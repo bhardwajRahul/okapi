@@ -631,6 +631,9 @@ func validateStruct(v any) error {
 		if sf.Tag.Get(tagRequired) == constTRUE && isEmptyValue(field) {
 			return fmt.Errorf("field %s is required", sf.Name)
 		}
+		if checkConditionalRequired(val, field, sf) {
+			return fmt.Errorf("field %s is required", sf.Name)
+		}
 		for _, check := range fieldConstraintCheckers {
 			if err := check(field, sf); err != nil {
 				return fmt.Errorf("field %s: %w", sf.Name, err)

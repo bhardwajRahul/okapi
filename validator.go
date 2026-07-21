@@ -26,6 +26,7 @@ package okapi
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net"
@@ -64,7 +65,7 @@ func (c *Context) bindStruct(input any) error {
 		}
 
 		// Handle validations
-		if err := c.validateField(field, sf); err != nil {
+		if err := c.validateField(v, field, sf); err != nil {
 			return err
 		}
 	}
@@ -161,6 +162,7 @@ var fieldConstraintCheckers = []func(reflect.Value, reflect.StructField) error{
 	checkChoiceConstraints,
 	checkFormatConstraints,
 	checkCollectionConstraints,
+	checkSubstringConstraints,
 }
 
 // checkNumericConstraints validates min, max, exclusiveMin, exclusiveMax, and multipleOf.
@@ -272,10 +274,99 @@ func checkCollectionConstraints(field reflect.Value, sf reflect.StructField) err
 	return nil
 }
 
+// checkSubstringConstraints validates contains and notContains (both handle slices element-wise).
+func checkSubstringConstraints(field reflect.Value, sf reflect.StructField) error {
+	if tag := sf.Tag.Get(tagContains); tag != "" {
+		if err := checkContains(field, tag, true); err != nil {
+			return err
+		}
+	}
+	if tag := sf.Tag.Get(tagNotContains); tag != "" {
+		if err := checkContains(field, tag, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkContains asserts a string field contains (want=true) or does not contain
+// (want=false) the given substring. For slice fields, each element is validated.
+func checkContains(field reflect.Value, substr string, want bool) error {
+	if field.Kind() == reflect.Slice {
+		for i := 0; i < field.Len(); i++ {
+			if err := checkContainsValue(field.Index(i), substr, want); err != nil {
+				return fmt.Errorf("element [%d]: %w", i, err)
+			}
+		}
+		return nil
+	}
+	return checkContainsValue(field, substr, want)
+}
+
+func checkContainsValue(field reflect.Value, substr string, want bool) error {
+	if field.Kind() != reflect.String {
+		return fmt.Errorf("contains validation can only be applied to string fields")
+	}
+	value := field.String()
+	if value == "" {
+		return nil
+	}
+	if got := strings.Contains(value, substr); got != want {
+		if want {
+			return fmt.Errorf("value '%s' must contain '%s'", value, substr)
+		}
+		return fmt.Errorf("value '%s' must not contain '%s'", value, substr)
+	}
+	return nil
+}
+
+// checkConditionalRequired reports whether a requiredIf, requiredWith, or
+// requiredWithout rule on the field is triggered while the field is empty.
+// structVal is the parent struct so sibling fields can be resolved by name.
+func checkConditionalRequired(structVal, field reflect.Value, sf reflect.StructField) bool {
+	required := false
+
+	if tag := sf.Tag.Get(tagRequiredIf); tag != "" {
+		name, want, ok := strings.Cut(strings.TrimSpace(tag), " ")
+		if ok {
+			if sibling := structVal.FieldByName(name); sibling.IsValid() {
+				if fmt.Sprintf("%v", sibling.Interface()) == strings.TrimSpace(want) {
+					required = true
+				}
+			}
+		}
+	}
+
+	if tag := sf.Tag.Get(tagRequiredWith); tag != "" {
+		for _, name := range strings.Split(tag, ",") {
+			sibling := structVal.FieldByName(strings.TrimSpace(name))
+			if sibling.IsValid() && !isEmptyValue(sibling) {
+				required = true
+				break
+			}
+		}
+	}
+
+	if tag := sf.Tag.Get(tagRequiredWithout); tag != "" {
+		for _, name := range strings.Split(tag, ",") {
+			sibling := structVal.FieldByName(strings.TrimSpace(name))
+			if !sibling.IsValid() || isEmptyValue(sibling) {
+				required = true
+				break
+			}
+		}
+	}
+
+	return required && isEmptyValue(field)
+}
+
 // validateField performs tag-based validations: required, min/max, length constraints,
 // enum, const, multipleOf, format, pattern, and slice/map validations.
-func (c *Context) validateField(field reflect.Value, sf reflect.StructField) error {
+func (c *Context) validateField(structVal, field reflect.Value, sf reflect.StructField) error {
 	if sf.Tag.Get(tagRequired) == constTRUE && isEmptyValue(field) {
+		return fmt.Errorf("field %s is required", sf.Name)
+	}
+	if checkConditionalRequired(structVal, field, sf) {
 		return fmt.Errorf("field %s is required", sf.Name)
 	}
 	for _, check := range fieldConstraintCheckers {
@@ -295,6 +386,9 @@ func (c *Context) validateStruct(v reflect.Value, parentField reflect.StructFiel
 		sf := t.Field(i)
 
 		if sf.Tag.Get(tagRequired) == constTRUE && isEmptyValue(field) {
+			return fmt.Errorf("field %s.%s is required", parentField.Name, sf.Name)
+		}
+		if checkConditionalRequired(v, field, sf) {
 			return fmt.Errorf("field %s.%s is required", parentField.Name, sf.Name)
 		}
 		for _, check := range fieldConstraintCheckers {
@@ -557,6 +651,13 @@ var formatValidators = map[string]func(string) error{
 	formatUppercase:    validateUppercase,
 	formatSlug:         validateSlug,
 	formatHexColor:     validateHexColor,
+	formatJSON:         validateJSON,
+	formatJWT:          validateJWT,
+	formatBase64URL:    validateBase64URL,
+	formatPort:         validatePort,
+	formatTimezone:     validateTimezone,
+	formatLatitude:     validateLatitude,
+	formatLongitude:    validateLongitude,
 }
 
 // checkFormatValue validates a single value against a format tag
@@ -1060,6 +1161,83 @@ func validateSlug(value string) error {
 func validateHexColor(value string) error {
 	if !hexColorRegex.MatchString(value) {
 		return fmt.Errorf("invalid hex color (expected #RGB or #RRGGBB): %s", value)
+	}
+	return nil
+}
+
+func validateJSON(value string) error {
+	if !json.Valid([]byte(value)) {
+		return fmt.Errorf("invalid JSON: %s", value)
+	}
+	return nil
+}
+
+// validateJWT checks for three non-empty base64url segments (header.payload.signature).
+func validateJWT(value string) error {
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 {
+		return fmt.Errorf("invalid JWT (expected 3 segments): %s", value)
+	}
+	// Header and payload must be non-empty base64url; signature may be empty (e.g. alg=none).
+	for _, p := range parts[:2] {
+		if p == "" {
+			return fmt.Errorf("invalid JWT (empty segment): %s", value)
+		}
+	}
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		if _, err := base64.RawURLEncoding.DecodeString(p); err != nil {
+			return fmt.Errorf("invalid JWT (segment is not base64url): %s", value)
+		}
+	}
+	return nil
+}
+
+// validateBase64URL accepts both padded and unpadded URL-safe base64.
+func validateBase64URL(value string) error {
+	if _, err := base64.URLEncoding.DecodeString(value); err == nil {
+		return nil
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(value); err == nil {
+		return nil
+	}
+	return fmt.Errorf("invalid base64url value: %s", value)
+}
+
+func validatePort(value string) error {
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("invalid port (expected 1-65535): %s", value)
+	}
+	return nil
+}
+
+func validateTimezone(value string) error {
+	// LoadLocation treats "" as UTC and "Local" as the host zone, neither of which
+	// is a meaningful IANA name to validate against.
+	if value == "" || value == "Local" {
+		return fmt.Errorf("invalid timezone (expected IANA name, e.g. America/New_York): %s", value)
+	}
+	if _, err := time.LoadLocation(value); err != nil {
+		return fmt.Errorf("invalid timezone (expected IANA name, e.g. America/New_York): %s", value)
+	}
+	return nil
+}
+
+func validateLatitude(value string) error {
+	f, err := strconv.ParseFloat(value, 64)
+	if err != nil || f < -90 || f > 90 {
+		return fmt.Errorf("invalid latitude (expected -90 to 90): %s", value)
+	}
+	return nil
+}
+
+func validateLongitude(value string) error {
+	f, err := strconv.ParseFloat(value, 64)
+	if err != nil || f < -180 || f > 180 {
+		return fmt.Errorf("invalid longitude (expected -180 to 180): %s", value)
 	}
 	return nil
 }

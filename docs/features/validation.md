@@ -33,10 +33,43 @@ Okapi provides declarative validation and automatic default value assignment usi
 | `string` / `[]string` | `const:"active"`               | Requires the field to equal a fixed value.               |
 | `string` / `[]string` | `format:"email"`               | Enables format validation (e.g. `email`, `uuid`, etc.).  |
 | `string` / `[]string` | `pattern:"^[a-zA-Z]+$"`        | Validates the field against a regular expression.        |
+| `string` / `[]string` | `contains:"@"`                 | Ensures the string contains the given substring.         |
+| `string` / `[]string` | `notContains:" "`              | Ensures the string does not contain the given substring. |
 
-> **Slices:** `enum`, `const`, `format`, and `pattern` apply to **each element** of a `[]string` field. Failures are reported per index, e.g. `element [2]: ...`.
+> **Slices:** `enum`, `const`, `format`, `pattern`, `contains`, and `notContains` apply to **each element** of a `[]string` field. Failures are reported per index, e.g. `element [2]: ...`.
 
-> **Empty values:** `enum`, `const`, `format`, and `pattern` skip empty strings — combine with `required:"true"` to also enforce presence.
+> **Empty values:** `enum`, `const`, `format`, `pattern`, `contains`, and `notContains` skip empty strings — combine with `required:"true"` to also enforce presence.
+
+### Conditional Required Tags
+
+These make a field's requiredness depend on **sibling fields** in the same struct. Referenced fields use their **Go field name**, not the JSON name.
+
+| Tag                            | Description                                                                   |
+|--------------------------------|-------------------------------------------------------------------------------|
+| `requiredIf:"Type card"`       | Required when the sibling field `Type` equals `card`.                         |
+| `requiredWith:"Pass"`          | Required when any of the listed sibling fields (comma-separated) is non-empty. |
+| `requiredWithout:"Email"`      | Required when any of the listed sibling fields (comma-separated) is empty.     |
+
+```go
+type Payment struct {
+    Type    string `json:"type"`
+    Card    string `json:"card"    requiredIf:"Type card"`
+    Pass    string `json:"pass"`
+    Confirm string `json:"confirm" requiredWith:"Pass"`
+    Email   string `json:"email"`
+    Phone   string `json:"phone"   requiredWithout:"Email"`
+}
+```
+
+### Schema Annotations
+
+These emit OpenAPI schema keywords and are documentation-only (no runtime enforcement).
+
+| Tag                | Description                                                        |
+|--------------------|-------------------------------------------------------------------|
+| `readOnly:"true"`  | Marks the property `readOnly` (returned but not sent by clients). |
+| `writeOnly:"true"` | Marks the property `writeOnly` (sent but not returned).           |
+| `nullable:"true"`  | Marks the property as `nullable`. Pointer fields are nullable automatically. |
 
 
 
@@ -74,6 +107,9 @@ fields (and each element of `[]string` fields).
 | `semver`        | `format:"semver"`       | Semantic version (e.g. `1.2.3-alpha.1`).                  |
 | `json-pointer`  | `format:"json-pointer"` | JSON Pointer (RFC 6901).                                   |
 | `byte` / `base64`| `format:"byte"`        | Base64-encoded value.                                     |
+| `base64url`     | `format:"base64url"`    | URL-safe Base64 (padded or unpadded).                     |
+| `jwt`           | `format:"jwt"`          | JSON Web Token (three base64url segments).                |
+| `port`          | `format:"port"`         | TCP/UDP port number (`1`–`65535`).                        |
 
 #### String content
 
@@ -87,6 +123,15 @@ fields (and each element of `[]string` fields).
 | `uppercase`    | `format:"uppercase"`    | No lowercase characters.                            |
 | `slug`         | `format:"slug"`         | URL slug (e.g. `my-post-123`).                     |
 | `hexcolor`     | `format:"hexcolor"`     | Hex color (`#RGB` or `#RRGGBB`).                   |
+| `json`         | `format:"json"`         | A syntactically valid JSON string.                  |
+
+#### Geo & time zones
+
+| Format      | Tag                  | Description                                          |
+|-------------|----------------------|-----------------------------------------------------|
+| `latitude`  | `format:"latitude"`  | Decimal latitude in the range `-90` to `90`.       |
+| `longitude` | `format:"longitude"` | Decimal longitude in the range `-180` to `180`.    |
+| `timezone`  | `format:"timezone"`  | IANA time zone name (e.g. `America/New_York`).     |
 
 #### Custom pattern
 

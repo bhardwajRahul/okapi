@@ -1154,20 +1154,24 @@ func (o *Okapi) Any(path string, h HandlerFunc, opts ...RouteOption) *Route {
 // Static serves static files under a path prefix, without directory listing
 func (o *Okapi) Static(prefix string, dir string) {
 	fs := http.StripPrefix(prefix, http.FileServer(noDirListing{http.Dir(dir)}))
-	o.router.muxRouter.PathPrefix(prefix).Handler(fs).Methods(http.MethodGet)
+	o.router.muxRouter.PathPrefix(prefix).
+		HandlerFunc(o.dispatchThroughChain(fs.ServeHTTP)).
+		Methods(http.MethodGet)
 }
 
 // StaticFile serves a single file at the specified path.
 func (o *Okapi) StaticFile(path string, filepath string) {
-	o.router.muxRouter.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+	o.router.muxRouter.HandleFunc(path, o.dispatchThroughChain(func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, filepath)
-	}).Methods(http.MethodGet)
+	})).Methods(http.MethodGet)
 }
 
 // StaticFS serves static files from a custom http.FileSystem (e.g., embed.FS).
 func (o *Okapi) StaticFS(prefix string, fs http.FileSystem) {
 	fileServer := http.StripPrefix(prefix, http.FileServer(fs))
-	o.router.muxRouter.PathPrefix(prefix).Handler(fileServer).Methods(http.MethodGet)
+	o.router.muxRouter.PathPrefix(prefix).
+		HandlerFunc(o.dispatchThroughChain(fileServer.ServeHTTP)).
+		Methods(http.MethodGet)
 }
 
 // addRoute adds a route with the specified method to the Okapi instance
@@ -1517,6 +1521,31 @@ func buildBaseLogFields(c *Context, status int, duration time.Duration) []any {
 		"user_agent", c.request.UserAgent(),
 	}
 }
+
+// dispatchThroughChain wraps a raw http.HandlerFunc so it runs through Okapi's
+// global middleware chain (access log, debug fields, and any user-registered
+// global middleware) via a Context, mirroring how regular routes are
+// dispatched.
+func (o *Okapi) dispatchThroughChain(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := NewContext(o, w, r)
+		global := o.globalMiddlewares()
+		handlers := make([]HandlerFunc, 0, len(global)+1)
+		handlers = append(handlers, global...)
+		handlers = append(handlers, func(c *Context) error {
+			next(c.response, c.request)
+			return nil
+		})
+		ctx.handlers = handlers
+		ctx.index = -1
+		if err := ctx.Next(); err != nil {
+			if ctx.response.StatusCode() == 0 {
+				http.Error(ctx.response, err.Error(), http.StatusInternalServerError)
+			}
+		}
+	}
+}
+
 func (o *Okapi) wrapHandleFunc(h HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := NewContext(o, w, r)

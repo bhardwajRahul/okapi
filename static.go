@@ -184,7 +184,7 @@ func (o *Okapi) webHandler(prefix string, root http.FileSystem, c WebConfig) {
 		serveWebIndex(w, r, root, c.Index)
 	}
 	o.router.muxRouter.PathPrefix(prefix).
-		HandlerFunc(handler).
+		HandlerFunc(o.dispatchThroughChain(handler)).
 		Methods(http.MethodGet, http.MethodHead)
 }
 

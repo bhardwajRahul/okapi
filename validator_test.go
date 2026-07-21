@@ -1601,3 +1601,199 @@ func TestTier1ValidationIntegration(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{"valid object", `{"a":1}`, false},
+		{"valid array", `[1,2,3]`, false},
+		{"valid string", `"hello"`, false},
+		{"valid number", `42`, false},
+		{"invalid trailing", `{"a":1}x`, true},
+		{"invalid unclosed", `{"a":`, true},
+		{"not json", `hello`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateJSON(tt.value); (err != nil) != tt.wantErr {
+				t.Errorf("validateJSON() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateJWT(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{"valid", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2ln", false},
+		{"valid empty signature", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.", false},
+		{"two segments", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ", true},
+		{"empty header", ".eyJzdWIiOiIxMjMifQ.c2ln", true},
+		{"non base64url segment", "not_base64!.payload.sig", true},
+		{"four segments", "a.b.c.d", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateJWT(tt.value); (err != nil) != tt.wantErr {
+				t.Errorf("validateJWT() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateBase64URL(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{"padded", "Zm9vYmFy", false},
+		{"url-safe chars", "a-b_cd", false},
+		{"unpadded", "Zm9vYg", false},
+		{"standard base64 with plus", "a+b/c=", true},
+		{"invalid char", "not base64!", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateBase64URL(tt.value); (err != nil) != tt.wantErr {
+				t.Errorf("validateBase64URL() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidatePort(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{"min", "1", false},
+		{"max", "65535", false},
+		{"typical", "8080", false},
+		{"zero", "0", true},
+		{"too high", "65536", true},
+		{"negative", "-1", true},
+		{"not a number", "http", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validatePort(tt.value); (err != nil) != tt.wantErr {
+				t.Errorf("validatePort() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateTimezone(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{"iana", "America/New_York", false},
+		{"utc", "UTC", false},
+		{"empty", "", true},
+		{"local", "Local", true},
+		{"bogus", "Mars/Phobos", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateTimezone(tt.value); (err != nil) != tt.wantErr {
+				t.Errorf("validateTimezone() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateLatitudeLongitude(t *testing.T) {
+	if err := validateLatitude("45.5"); err != nil {
+		t.Errorf("validateLatitude(45.5) unexpected error: %v", err)
+	}
+	if err := validateLatitude("91"); err == nil {
+		t.Error("validateLatitude(91) expected error")
+	}
+	if err := validateLongitude("-179.9"); err != nil {
+		t.Errorf("validateLongitude(-179.9) unexpected error: %v", err)
+	}
+	if err := validateLongitude("181"); err == nil {
+		t.Error("validateLongitude(181) expected error")
+	}
+}
+
+func TestContainsValidation(t *testing.T) {
+	type Req struct {
+		Path  string `json:"path" contains:"/"`
+		Token string `json:"token" notContains:" "`
+	}
+	tests := []struct {
+		name        string
+		body        string
+		wantErr     bool
+		errContains string
+	}{
+		{"valid", `{"path":"/a/b","token":"abc"}`, false, ""},
+		{"missing substring", `{"path":"noslash","token":"abc"}`, true, "must contain '/'"},
+		{"forbidden substring", `{"path":"/a","token":"a b"}`, true, "must not contain"},
+		{"empty optional skipped", `{}`, false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := NewTestContext(http.MethodPost, "/test", strings.NewReader(tt.body))
+			c.request.Header.Set("Content-Type", "application/json")
+			var req Req
+			err := c.Bind(&req)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Bind() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("Bind() error = %v, should contain %q", err, tt.errContains)
+				}
+			}
+		})
+	}
+}
+
+func TestConditionalRequiredValidation(t *testing.T) {
+	type Req struct {
+		Type    string `json:"type"`
+		Card    string `json:"card" requiredIf:"Type card"`
+		Pass    string `json:"pass"`
+		Confirm string `json:"confirm" requiredWith:"Pass"`
+		Email   string `json:"email"`
+		Phone   string `json:"phone" requiredWithout:"Email"`
+	}
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{"requiredIf triggered and missing", `{"type":"card","email":"a@b.co"}`, true},
+		{"requiredIf triggered and present", `{"type":"card","card":"4111","email":"a@b.co"}`, false},
+		{"requiredIf not triggered", `{"type":"cash","email":"a@b.co"}`, false},
+		{"requiredWith triggered and missing", `{"pass":"secret","email":"a@b.co"}`, true},
+		{"requiredWith triggered and present", `{"pass":"secret","confirm":"secret","email":"a@b.co"}`, false},
+		{"requiredWithout triggered and missing", `{}`, true},
+		{"requiredWithout satisfied by sibling", `{"email":"a@b.co"}`, false},
+		{"requiredWithout satisfied by self", `{"phone":"+123"}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := NewTestContext(http.MethodPost, "/test", strings.NewReader(tt.body))
+			c.request.Header.Set("Content-Type", "application/json")
+			var req Req
+			err := c.Bind(&req)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Bind() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
