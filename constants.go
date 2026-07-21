@@ -97,6 +97,18 @@ const (
 	tagExclusiveMax  = "exclusiveMax"
 	tagMinProperties = "minProperties"
 	tagMaxProperties = "maxProperties"
+	tagContains      = "contains"
+	tagNotContains   = "notContains"
+
+	// Conditional required tags (runtime-only; depend on sibling field values).
+	tagRequiredIf      = "requiredIf"
+	tagRequiredWith    = "requiredWith"
+	tagRequiredWithout = "requiredWithout"
+
+	// Schema-side annotations mapped to OpenAPI keywords.
+	tagReadOnly  = "readOnly"
+	tagWriteOnly = "writeOnly"
+	tagNullable  = "nullable"
 
 	// extOkapiConst is an internal marker extension used to carry an OpenAPI 3.1
 	// `const` value on the version-agnostic base schema. It is promoted to a real
@@ -138,6 +150,14 @@ const (
 	formatUppercase    = "uppercase"
 	formatSlug         = "slug"
 	formatHexColor     = "hexcolor"
+	// additional formats
+	formatJSON      = "json"
+	formatJWT       = "jwt"
+	formatBase64URL = "base64url"
+	formatPort      = "port"
+	formatTimezone  = "timezone"
+	formatLatitude  = "latitude"
+	formatLongitude = "longitude"
 	// Special values
 	bodyValue = "body"
 	bodyField = "Body"

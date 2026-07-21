@@ -536,3 +536,38 @@ func TestOpenAPIValidationKeywords(t *testing.T) {
 	validateOpenAPIDoc(t, spec30)
 	validateOpenAPIDoc(t, spec31)
 }
+
+// schemaAnnotationModel exercises the readOnly, writeOnly, and nullable tags.
+type schemaAnnotationModel struct {
+	ID       string `json:"id" readOnly:"true"`
+	Password string `json:"password" writeOnly:"true"`
+	Nickname string `json:"nickname" nullable:"true"`
+}
+
+func TestOpenAPISchemaAnnotations(t *testing.T) {
+	o := New()
+	o.WithOpenAPIDocs(OpenAPI{
+		Title:   "Schema Annotations",
+		Version: "1.0.0",
+		License: License{Name: "MIT"},
+		Servers: Servers{{URL: "http://localhost:8080"}},
+	})
+	o.Post("/things", anyHandler,
+		DocRequestBody(&schemaAnnotationModel{}),
+		DocResponse(200, &schemaAnnotationModel{}),
+	)
+	o.buildOpenAPISpec()
+
+	spec30 := o.openapiSpec
+	spec31 := o.openapiSpec31
+
+	m30 := spec30.Components.Schemas["schemaAnnotationModel"].Value
+	require.NotNil(t, m30)
+
+	assert.True(t, m30.Properties["id"].Value.ReadOnly)
+	assert.True(t, m30.Properties["password"].Value.WriteOnly)
+	assert.True(t, m30.Properties["nickname"].Value.Nullable)
+
+	validateOpenAPIDoc(t, spec30)
+	validateOpenAPIDoc(t, spec31)
+}

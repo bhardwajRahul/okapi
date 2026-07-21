@@ -1794,6 +1794,16 @@ func applyValidationTags(schema *openapi3.Schema, tag reflect.StructTag) {
 		}
 		schema.Extensions[extOkapiConst] = constVal
 	}
+	// Schema annotations mapped directly to OpenAPI keywords.
+	if tag.Get(tagReadOnly) == constTRUE {
+		schema.ReadOnly = true
+	}
+	if tag.Get(tagWriteOnly) == constTRUE {
+		schema.WriteOnly = true
+	}
+	if tag.Get(tagNullable) == constTRUE {
+		schema.Nullable = true
+	}
 }
 
 // applyStringSchemaTags applies minLength, maxLength, pattern, and format.
