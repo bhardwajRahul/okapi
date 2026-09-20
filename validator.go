@@ -73,19 +73,24 @@ func (c *Context) bindStruct(input any) error {
 	return nil
 }
 
-// extractAndSetField extracts a field's value from request sources (headers, query, cookies, params, body)
-// and assigns it to the struct field.
+// extractAndSetField extracts a field's value from request sources (params, query, headers, cookies, body)
+// and assigns it to the struct field. For a field tagged with several sources, the first non-empty value
+// wins, in the order param, path, query, header, cookie.
 func (c *Context) extractAndSetField(field reflect.Value, sf reflect.StructField) error {
 	var raw string
 	var rawSlice []string
+	found := func() bool { return raw != "" || len(rawSlice) > 0 }
 
-	// Header
-	if key := sf.Tag.Get(tagHeader); key != "" {
-		raw = c.Header(key)
+	// Path / Param
+	if key := sf.Tag.Get(tagParam); key != "" {
+		raw = c.Param(key)
+	}
+	if key := sf.Tag.Get(tagPath); key != "" && !found() {
+		raw = c.Param(key)
 	}
 
 	// Query - supports slices and comma-separated values
-	if key := sf.Tag.Get(tagQuery); key != "" {
+	if key := sf.Tag.Get(tagQuery); key != "" && !found() {
 		if field.Kind() == reflect.Slice {
 			rawSlice = c.QueryArray(key)
 			if len(rawSlice) == 1 && strings.Contains(rawSlice[0], ",") {
@@ -96,23 +101,20 @@ func (c *Context) extractAndSetField(field reflect.Value, sf reflect.StructField
 		}
 	}
 
+	// Header
+	if key := sf.Tag.Get(tagHeader); key != "" && !found() {
+		raw = c.Header(key)
+	}
+
 	// Cookie
-	if key := sf.Tag.Get(tagCookie); key != "" {
+	if key := sf.Tag.Get(tagCookie); key != "" && !found() {
 		if cookie, err := c.Cookie(key); err == nil {
 			raw = cookie
 		}
 	}
 
-	// Path / Param
-	if key := sf.Tag.Get(tagPath); key != "" {
-		raw = c.Param(key)
-	}
-	if key := sf.Tag.Get(tagParam); key != "" {
-		raw = c.Param(key)
-	}
-
 	// Body binding (special case)
-	if sf.Tag.Get(tagJSON) == bodyValue || sf.Name == bodyField {
+	if sf.Name == bodyField {
 		bodyPtr := reflect.New(sf.Type)
 		if err := c.Bind(bodyPtr.Interface()); err != nil {
 			return fmt.Errorf("failed to bind body: %w", err)
@@ -163,6 +165,34 @@ var fieldConstraintCheckers = []func(reflect.Value, reflect.StructField) error{
 	checkFormatConstraints,
 	checkCollectionConstraints,
 	checkSubstringConstraints,
+}
+
+// checkFieldConstraints runs fieldConstraintCheckers against a field. Pointer
+// fields are validated through the value they point to; a nil pointer has no
+// value to constrain, so only the required rules checked by callers apply.
+func checkFieldConstraints(field reflect.Value, sf reflect.StructField) error {
+	field, ok := derefValue(field)
+	if !ok {
+		return nil
+	}
+	for _, check := range fieldConstraintCheckers {
+		if err := check(field, sf); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// derefValue unwraps pointers down to the underlying value.
+// ok is false when a nil pointer is reached.
+func derefValue(v reflect.Value) (reflect.Value, bool) {
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return v, false
+		}
+		v = v.Elem()
+	}
+	return v, true
 }
 
 // checkNumericConstraints validates min, max, exclusiveMin, exclusiveMax, and multipleOf.
@@ -329,7 +359,7 @@ func checkConditionalRequired(structVal, field reflect.Value, sf reflect.StructF
 	if tag := sf.Tag.Get(tagRequiredIf); tag != "" {
 		name, want, ok := strings.Cut(strings.TrimSpace(tag), " ")
 		if ok {
-			if sibling := structVal.FieldByName(name); sibling.IsValid() {
+			if sibling, ok := derefValue(structVal.FieldByName(name)); ok && sibling.IsValid() {
 				if fmt.Sprintf("%v", sibling.Interface()) == strings.TrimSpace(want) {
 					required = true
 				}
@@ -369,10 +399,8 @@ func (c *Context) validateField(structVal, field reflect.Value, sf reflect.Struc
 	if checkConditionalRequired(structVal, field, sf) {
 		return fmt.Errorf("field %s is required", sf.Name)
 	}
-	for _, check := range fieldConstraintCheckers {
-		if err := check(field, sf); err != nil {
-			return fmt.Errorf("field %s: %w", sf.Name, err)
-		}
+	if err := checkFieldConstraints(field, sf); err != nil {
+		return fmt.Errorf("field %s: %w", sf.Name, err)
 	}
 	return nil
 }
@@ -391,10 +419,8 @@ func (c *Context) validateStruct(v reflect.Value, parentField reflect.StructFiel
 		if checkConditionalRequired(v, field, sf) {
 			return fmt.Errorf("field %s.%s is required", parentField.Name, sf.Name)
 		}
-		for _, check := range fieldConstraintCheckers {
-			if err := check(field, sf); err != nil {
-				return fmt.Errorf("field %s.%s: %w", parentField.Name, sf.Name, err)
-			}
+		if err := checkFieldConstraints(field, sf); err != nil {
+			return fmt.Errorf("field %s.%s: %w", parentField.Name, sf.Name, err)
 		}
 	}
 
@@ -1282,13 +1308,27 @@ func checkMultipleOf(field reflect.Value, tag string) error {
 }
 func checkUniqueItems(field reflect.Value) error {
 	if field.Kind() == reflect.Slice {
+		// Comparable elements are tracked in a set. The rest, such as the maps
+		// and slices a []any decodes into, would panic as map keys, so they are
+		// compared with reflect.DeepEqual instead.
 		seen := make(map[interface{}]bool)
+		var others []interface{}
 		for i := 0; i < field.Len(); i++ {
-			item := field.Index(i).Interface()
-			if seen[item] {
-				return fmt.Errorf("slice contains duplicate item: %v", item)
+			elem := field.Index(i)
+			item := elem.Interface()
+			if elem.Comparable() {
+				if seen[item] {
+					return fmt.Errorf("slice contains duplicate item: %v", item)
+				}
+				seen[item] = true
+				continue
 			}
-			seen[item] = true
+			for _, prev := range others {
+				if reflect.DeepEqual(prev, item) {
+					return fmt.Errorf("slice contains duplicate item: %v", item)
+				}
+			}
+			others = append(others, item)
 		}
 	}
 	return nil

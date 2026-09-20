@@ -28,11 +28,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // *********** SSE ***********
@@ -136,11 +137,21 @@ func (m *Message) flush(w http.ResponseWriter) {
 	}
 }
 
+// sseLineEnds converts the line endings the event stream recognizes (CRLF, CR
+// and LF) to LF.
+var sseLineEnds = strings.NewReplacer("\r\n", "\n", "\r", "\n")
+
+// sanitizeSSEField strips the line terminators that separate fields in the
+// event stream.
+func sanitizeSSEField(value string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(value)
+}
+
 func (m *Message) writeID(w http.ResponseWriter, id string) error {
 	if id == "" {
 		return nil
 	}
-	_, err := fmt.Fprintf(w, "id: %s\n", id)
+	_, err := fmt.Fprintf(w, "id: %s\n", sanitizeSSEField(id))
 	return err
 }
 
@@ -148,7 +159,7 @@ func (m *Message) writeEvent(w http.ResponseWriter, eventType string) error {
 	if eventType == "" {
 		return nil
 	}
-	_, err := fmt.Fprintf(w, "event: %s\n", eventType)
+	_, err := fmt.Fprintf(w, "event: %s\n", sanitizeSSEField(eventType))
 	return err
 }
 
@@ -196,7 +207,9 @@ func (m *Message) writeData(w http.ResponseWriter, data any) error {
 			output = string(jsonBytes)
 		}
 	}
-	lines := strings.Split(output, "\n")
+	// A lone CR ends a line in the event stream just like LF, so normalize
+	// every line ending before splitting, or a CR would start a new field
+	lines := strings.Split(sseLineEnds.Replace(output), "\n")
 	for _, line := range lines {
 		if _, err = fmt.Fprintf(w, "data: %s\n", line); err != nil {
 			return err

@@ -27,7 +27,9 @@ package okapi
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -97,22 +99,17 @@ func (jwtAuth *JWTAuth) extractTokenFrom(c *Context, lookup string) (string, err
 	}
 }
 
-// ValidateToken checks the JWT token and returns the claims if valid
+// ValidateToken checks the JWT token and returns the claims if valid.
+//
+// It applies exactly the checks Middleware does — key resolution, the
+// algorithm allow-list, expiry, Audience, Issuer, ClaimsExpression,
+// ValidateClaims and ValidateRole — but writes no response and does not call
+// OnUnauthorized. The returned error's message is safe to show a client; the
+// underlying cause is reachable with errors.Is and errors.As.
 func (jwtAuth *JWTAuth) ValidateToken(c *Context) (jwt.MapClaims, error) {
-	tokenStr, err := jwtAuth.extractToken(c)
-	if err != nil {
-		return nil, err
-	}
-
-	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return signingSecret(jwtAuth.SigningSecret, jwtAuth.SecretKey), nil
-	})
-
-	if err != nil || !token.Valid {
-		return nil, errors.New("invalid or expired token")
+	token, authErr := jwtAuth.authenticate(c)
+	if authErr != nil {
+		return nil, authErr
 	}
 
 	if claims, ok := token.Claims.(jwt.MapClaims); ok {
@@ -120,6 +117,101 @@ func (jwtAuth *JWTAuth) ValidateToken(c *Context) (jwt.MapClaims, error) {
 	}
 	return nil, errors.New("invalid claims type")
 }
+
+// jwtAuthError is a failed JWT authentication or authorization check.
+type jwtAuthError struct {
+	status  int
+	message string
+	logMsg  string
+	err     error
+}
+
+func (e *jwtAuthError) Error() string { return e.message }
+
+func (e *jwtAuthError) Unwrap() error { return e.err }
+
+func (jwtAuth *JWTAuth) authenticate(c *Context) (*jwt.Token, *jwtAuthError) {
+	fail := func(status int, message, logMsg string, err error) *jwtAuthError {
+		return &jwtAuthError{status: status, message: message, logMsg: logMsg, err: err}
+	}
+
+	tokenStr, err := jwtAuth.extractToken(c)
+	if err != nil || tokenStr == "" {
+		return nil, fail(http.StatusUnauthorized, "Missing or invalid token", "Failed to extract token", err)
+	}
+
+	keyFunc, err := jwtAuth.resolveKeyFunc()
+	if err != nil {
+		return nil, fail(http.StatusUnauthorized, "Invalid token", "No JWT signing key is configured", err)
+	}
+
+	token, err := jwt.Parse(tokenStr, keyFunc, jwtAuth.parserOptions(jwtAuth.validMethods())...)
+	if err != nil || !token.Valid {
+		return nil, fail(http.StatusUnauthorized, "Invalid or expired token", "Failed to validate token", err)
+	}
+
+	// If claims expression is configured, validate the claims
+	if jwtAuth.ClaimsExpression != "" {
+		valid, err := jwtAuth.validateJWTClaims(token)
+		if err != nil {
+			return nil, fail(http.StatusUnauthorized, "failed to validate authentication permissions",
+				"Failed to validate JWT claims expression", err)
+		}
+		if !valid {
+			return nil, fail(http.StatusForbidden, "Insufficient permissions",
+				"JWT claims did not meet required expression", nil)
+		}
+	}
+	// If custom claims validation function is provided, use it
+	if jwtAuth.ValidateClaims != nil {
+		if err = jwtAuth.ValidateClaims(c, token.Claims); err != nil {
+			return nil, fail(http.StatusForbidden, "Insufficient permissions", "Failed to validate JWT claims", err)
+		}
+	}
+	// If ValidateRole is configured, validate the role claim
+	if jwtAuth.ValidateRole != nil {
+		if err = jwtAuth.ValidateRole(token.Claims); err != nil {
+			return nil, fail(http.StatusForbidden, "Insufficient permissions", "Failed to validate JWT role", err)
+		}
+	}
+	return token, nil
+}
+
+// validMethods returns the signing algorithms accepted for this configuration.
+func (jwtAuth *JWTAuth) validMethods() []string {
+	if len(jwtAuth.Algorithms) > 0 {
+		return jwtAuth.Algorithms
+	}
+	if jwtAuth.Algo != "" {
+		return []string{jwtAuth.Algo}
+	}
+	return jwtAlgo
+}
+
+// parserOptions builds the jwt.Parser options for this configuration.
+//
+// Audience and Issuer are only registered when set. jwt.WithAudience and
+// jwt.WithIssuer are variadic, so passing an empty string is not "no
+// expectation" — it registers "" as the expected value and makes the claim
+// mandatory, which rejects every real token.
+//
+// An "exp" claim is required unless AllowMissingExpiry is set: golang-jwt
+// validates "exp" only when it is present, so a signed token that omits it
+// would otherwise be valid forever.
+func (jwtAuth *JWTAuth) parserOptions(validMethods []string) []jwt.ParserOption {
+	opts := []jwt.ParserOption{jwt.WithValidMethods(validMethods)}
+	if !jwtAuth.AllowMissingExpiry {
+		opts = append(opts, jwt.WithExpirationRequired())
+	}
+	if jwtAuth.Audience != "" {
+		opts = append(opts, jwt.WithAudience(jwtAuth.Audience))
+	}
+	if jwtAuth.Issuer != "" {
+		opts = append(opts, jwt.WithIssuer(jwtAuth.Issuer))
+	}
+	return opts
+}
+
 func (jwtAuth *JWTAuth) resolveKeyFunc() (jwt.Keyfunc, error) {
 	if jwtAuth.JwksUrl != "" {
 		return func(token *jwt.Token) (interface{}, error) {
@@ -127,16 +219,25 @@ func (jwtAuth *JWTAuth) resolveKeyFunc() (jwt.Keyfunc, error) {
 			if !ok {
 				return nil, fmt.Errorf("missing 'kid' in JWT header")
 			}
-			jwks, err := fetchJWKS(jwtAuth.JwksUrl)
+
+			jwks, err := jwksFromCache(jwtAuth.JwksUrl, jwtAuth.JwksCacheTTL)
 			if err != nil {
 				return nil, err
 			}
-			return jwks.getKey(kid)
+
+			key, err := jwks.getKey(kid)
+			if err == nil {
+				return key, nil
+			}
+
+			if refreshed, ok := jwksRefresh(jwtAuth.JwksUrl); ok {
+				return refreshed.getKey(kid)
+			}
+			return nil, err
 		}, nil
 	}
 
-	secret := signingSecret(jwtAuth.SigningSecret, jwtAuth.SecretKey)
-	if secret != nil {
+	if secret := signingSecret(jwtAuth.SigningSecret, jwtAuth.SecretKey); len(secret) != 0 {
 		return func(token *jwt.Token) (interface{}, error) {
 			return secret, nil
 		}, nil
@@ -159,15 +260,40 @@ func (jwtAuth *JWTAuth) resolveKeyFunc() (jwt.Keyfunc, error) {
 	return nil, fmt.Errorf("no JWT secret, RSA key, or JWKS URL configured")
 }
 
+// signingSecret returns the configured HMAC key, preferring SigningSecret over
+// the legacy SecretKey, or nil when neither is set.
 func signingSecret(signingSecret, old []byte) []byte {
-	if signingSecret != nil {
+	if len(signingSecret) != 0 {
 		return signingSecret
 	}
-	return old
-
+	if len(old) != 0 {
+		return old
+	}
+	return nil
 }
 
-// Updated validateJWTClaims method
+var (
+	claimsExprMu    sync.Mutex
+	claimsExprCache = map[string]Expression{}
+)
+
+// compileClaimsExpression parses expr, reusing the result across calls.
+func compileClaimsExpression(expr string) (Expression, error) {
+	claimsExprMu.Lock()
+	defer claimsExprMu.Unlock()
+
+	if parsed, ok := claimsExprCache[expr]; ok {
+		return parsed, nil
+	}
+
+	parsed, err := ParseExpression(expr)
+	if err != nil {
+		return nil, err
+	}
+	claimsExprCache[expr] = parsed
+	return parsed, nil
+}
+
 func (jwtAuth *JWTAuth) validateJWTClaims(token *jwt.Token) (bool, error) {
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
@@ -176,16 +302,12 @@ func (jwtAuth *JWTAuth) validateJWTClaims(token *jwt.Token) (bool, error) {
 
 	// Use expression-based validation if available
 	if jwtAuth.ClaimsExpression != "" {
-		// Parse expression if not already cached
-		if jwtAuth.parsedExpression == nil {
-			expr, err := ParseExpression(jwtAuth.ClaimsExpression)
-			if err != nil {
-				return false, fmt.Errorf("failed to parse claims expression: %v", err)
-			}
-			jwtAuth.parsedExpression = expr
+		expr, err := compileClaimsExpression(jwtAuth.ClaimsExpression)
+		if err != nil {
+			return false, fmt.Errorf("failed to parse claims expression: %v", err)
 		}
 
-		result, err := jwtAuth.parsedExpression.Evaluate(claims)
+		result, err := expr.Evaluate(claims)
 		if err != nil {
 			return false, fmt.Errorf("expression evaluation failed: %v", err)
 		}
@@ -269,8 +391,17 @@ func (jwtAuth *JWTAuth) formatContextValue(claimValue interface{}) string {
 	}
 }
 
-// GenerateJwtToken generates a JWT with custom claims and expiry
+// GenerateJwtToken generates an HS256-signed JWT with custom claims and expiry.
+//
+// It returns an error when secret is empty: a token signed with an empty key
+// can be forged by anyone, and JWTAuth rejects an empty secret.
 func GenerateJwtToken(secret []byte, claims jwt.MapClaims, ttl time.Duration) (string, error) {
+	if len(secret) == 0 {
+		return "", errors.New("okapi: GenerateJwtToken requires a non-empty secret")
+	}
+	if claims == nil {
+		claims = jwt.MapClaims{}
+	}
 	claims["exp"] = time.Now().Add(ttl).Unix()
 	claims["iat"] = time.Now().Unix()
 

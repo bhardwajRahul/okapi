@@ -39,28 +39,118 @@ import (
 	"strings"
 )
 
-// realIP extracts the real IP address of the client from the HTTP Request.
-func realIP(r *http.Request) string {
-	// Check the X-Forwarded-For header for the client IP.
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP in the comma-separated list.
-		if ips := strings.Split(xff, ","); len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
+// realIP extracts the client IP from the HTTP request, honouring the
+// X-Forwarded-For and X-Real-IP headers.
+//
+// trustedProxies, when non-nil, restricts that: the headers are read only if
+// the connection's own address falls inside one of the networks, and
+// X-Forwarded-For is then walked from the right. Proxies append the address
+// they received the request from, so everything left of the last trusted hop
+// was written by the client; the first untrusted address from the right is the
+// client as seen by the outermost trusted proxy.
+func realIP(r *http.Request, trustedProxies []*net.IPNet) string {
+	if trustedProxies == nil {
+		// Check the X-Forwarded-For header for the client IP.
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if ips := strings.Split(xff, ","); len(ips) > 0 {
+				return strings.TrimSpace(ips[0])
+			}
+		}
+
+		if ip := r.Header.Get("X-Real-IP"); ip != "" {
+			return strings.TrimSpace(ip)
+		}
+	} else if remoteAddrIn(r.RemoteAddr, trustedProxies) {
+		if ip, ok := forwardedClientIP(r.Header.Values("X-Forwarded-For"), trustedProxies); ok {
+			return ip
+		}
+		if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(ip) != nil {
+			return ip
 		}
 	}
 
-	// Check the X-Real-IP header as a fallback.
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return strings.TrimSpace(ip)
-	}
-
-	// Use the remote address if headers are not set.
 	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return ip
 	}
 
 	// Return the raw remote address as a last resort.
 	return r.RemoteAddr
+}
+
+// forwardedClientIP walks X-Forwarded-For from the right, skipping trusted
+// proxies, and returns the first address that is not one. A malformed entry
+// stops the walk: it cannot have been appended by a trusted proxy, so nothing
+// to its left can be attributed. When every entry is trusted, the leftmost is
+// returned.
+func forwardedClientIP(values []string, trustedProxies []*net.IPNet) (string, bool) {
+	hops := make([]string, 0, len(values))
+	for _, v := range values {
+		hops = append(hops, strings.Split(v, ",")...)
+	}
+	leftmost := ""
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop := strings.TrimSpace(hops[i])
+		if hop == "" {
+			continue
+		}
+		ip := net.ParseIP(hop)
+		if ip == nil {
+			return "", false
+		}
+		if !ipIn(ip, trustedProxies) {
+			return hop, true
+		}
+		leftmost = hop
+	}
+	return leftmost, leftmost != ""
+}
+
+// remoteAddrIn reports whether addr's host falls inside one of the networks.
+func remoteAddrIn(addr string, networks []*net.IPNet) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ipIn(ip, networks)
+}
+
+// ipIn reports whether ip falls inside one of the networks.
+func ipIn(ip net.IP, networks []*net.IPNet) bool {
+	for _, n := range networks {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseCIDRs converts CIDR blocks and bare IP addresses into networks.
+func parseCIDRs(entries []string) ([]*net.IPNet, error) {
+	networks := make([]*net.IPNet, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(entry); err == nil {
+			networks = append(networks, n)
+			continue
+		}
+		ip := net.ParseIP(entry)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid trusted proxy %q: not an IP address or CIDR block", entry)
+		}
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		}
+		networks = append(networks, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return networks, nil
 }
 
 // normalizeRoutePath ensures a clean path starting with '/'

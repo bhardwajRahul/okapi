@@ -25,6 +25,7 @@
 package okapi
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -33,7 +34,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // rsaJWK builds a JWK entry for the given RSA public key.
@@ -262,5 +268,335 @@ func TestFetchJWKS_NetworkError(t *testing.T) {
 
 	if _, err := fetchJWKS("http://127.0.0.1:1"); err == nil {
 		t.Error("expected error for unreachable JWKS endpoint")
+	}
+}
+
+// TestFetchJWKS_RejectsNonOK covers an endpoint whose error page happens to be
+// valid JSON: without a status check it was accepted as a key set.
+func TestFetchJWKS_RejectsNonOK(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	if _, err := fetchJWKS(srv.URL); err == nil {
+		t.Error("expected error for a non-200 JWKS response")
+	}
+}
+
+// TestFetchJWKS_LimitsBodySize covers a hostile endpoint streaming an
+// unbounded body into memory.
+func TestFetchJWKS_LimitsBodySize(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[{"kid":"pad","kty":"RSA","n":"`))
+		chunk := bytes.Repeat([]byte("A"), 64<<10)
+		for written := 0; written < 4<<20; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// The reader is cut off mid-document, so decoding fails rather than
+	// consuming the whole stream.
+	if _, err := fetchJWKS(srv.URL); err == nil {
+		t.Error("expected error for an oversized JWKS body")
+	}
+}
+
+// TestJWKSIsCached guards against refetching the key set on every request,
+// which lets unauthenticated traffic drive outbound calls to the identity
+// provider one-for-one.
+func TestJWKSIsCached(t *testing.T) {
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	auth := &JWTAuth{JwksUrl: srv.URL, Audience: "api"}
+	keyFunc, err := auth.resolveKeyFunc()
+	if err != nil {
+		t.Fatalf("resolveKeyFunc: %v", err)
+	}
+
+	tok := &jwt.Token{Header: map[string]any{"kid": "some-kid"}}
+	for i := 0; i < 25; i++ {
+		// Every lookup fails (the set is empty); the point is that failing
+		// lookups must not each cost an outbound request.
+		_, _ = keyFunc(tok)
+	}
+
+	if got := atomic.LoadInt64(&hits); got > 1 {
+		t.Errorf("JWKS endpoint hit %d times for 25 validations, want 1", got)
+	}
+}
+
+// TestJWKSFailureIsNotRetriedPerRequest covers the same amplification concern
+// when the endpoint is down.
+func TestJWKSFailureIsNotRetriedPerRequest(t *testing.T) {
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	auth := &JWTAuth{JwksUrl: srv.URL}
+	keyFunc, err := auth.resolveKeyFunc()
+	if err != nil {
+		t.Fatalf("resolveKeyFunc: %v", err)
+	}
+
+	tok := &jwt.Token{Header: map[string]any{"kid": "some-kid"}}
+	for i := 0; i < 10; i++ {
+		if _, err := keyFunc(tok); err == nil {
+			t.Fatal("expected an error while the endpoint is failing")
+		}
+	}
+
+	if got := atomic.LoadInt64(&hits); got > 1 {
+		t.Errorf("failing endpoint hit %d times for 10 validations, want 1", got)
+	}
+}
+
+// backdateJWKS ages the cached entry for url by age, as if its last fetch had
+// happened that long ago.
+func backdateJWKS(url string, age time.Duration) {
+	e := jwksEntryFor(url)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.fetchedAt = e.fetchedAt.Add(-age)
+	e.lastFetch = e.lastFetch.Add(-age)
+}
+
+// waitFor polls cond until it holds, failing the test after a few seconds.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 5s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestJWKSServesStaleSetWhileEndpointFails guards against a refetch storm once
+// the TTL expires during an identity provider outage: the cooldown applied only
+// while nothing was cached, so every request refetched — serialised, with a 5s
+// timeout each — and authentication failed although a usable set was cached.
+func TestJWKSServesStaleSetWhileEndpointFails(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+	set := &Jwks{Keys: []Jwk{rsaJWK(t, "k1", &key.PublicKey)}}
+
+	var hits atomic.Int64
+	var failing atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(set)
+	}))
+	t.Cleanup(srv.Close)
+
+	const ttl = time.Minute
+	auth := &JWTAuth{JwksUrl: srv.URL, JwksCacheTTL: ttl}
+	keyFunc, err := auth.resolveKeyFunc()
+	if err != nil {
+		t.Fatalf("resolveKeyFunc: %v", err)
+	}
+	tok := &jwt.Token{Header: map[string]any{"kid": "k1"}}
+	if _, err := keyFunc(tok); err != nil {
+		t.Fatalf("initial fetch: %v", err)
+	}
+
+	failing.Store(true)
+	// Past the TTL, well within the grace period, and no recent fetch.
+	backdateJWKS(srv.URL, 2*ttl)
+
+	validate := func(phase string) {
+		t.Helper()
+		for i := 0; i < 20; i++ {
+			if _, err := keyFunc(tok); err != nil {
+				t.Fatalf("%s, validation %d: cached key set not served during an outage: %v", phase, i, err)
+			}
+		}
+	}
+	validate("while refreshing")
+	waitFor(t, func() bool { return hits.Load() >= 2 })
+	validate("after the refresh failed")
+
+	if got := hits.Load(); got != 2 {
+		t.Errorf("JWKS endpoint hit %d times, want 2 (the initial fetch and one refresh)", got)
+	}
+}
+
+// TestJWKSStaleSetIsBounded covers the other side of the grace period: a set
+// is not served indefinitely while the endpoint keeps failing, so a key the
+// issuer withdrew eventually stops verifying tokens.
+func TestJWKSStaleSetIsBounded(t *testing.T) {
+	var failing atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	const ttl = time.Minute
+	if _, err := jwksFromCache(srv.URL, ttl); err != nil {
+		t.Fatalf("initial fetch: %v", err)
+	}
+
+	failing.Store(true)
+	backdateJWKS(srv.URL, 24*time.Hour)
+
+	if keys, err := jwksFromCache(srv.URL, ttl); err == nil {
+		t.Fatalf("served a key set a day past its TTL: %+v", keys)
+	}
+	// Still refused while cooling down after that failure.
+	if keys, err := jwksFromCache(srv.URL, ttl); err == nil {
+		t.Errorf("served a key set a day past its TTL during the cooldown: %+v", keys)
+	}
+}
+
+// TestJWKSRequestsDoNotQueueBehindSlowRefresh guards against every request
+// waiting on the per-URL lock while a single refresh sits on a slow endpoint,
+// although a usable key set is already cached.
+func TestJWKSRequestsDoNotQueueBehindSlowRefresh(t *testing.T) {
+	var hits atomic.Int64
+	var slow atomic.Bool
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if slow.Load() {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock) // runs before srv.Close
+
+	const ttl = time.Minute
+	if _, err := jwksFromCache(srv.URL, ttl); err != nil {
+		t.Fatalf("initial fetch: %v", err)
+	}
+
+	slow.Store(true)
+	backdateJWKS(srv.URL, 2*ttl)
+
+	// The first request after expiry starts the refresh, which now hangs.
+	go func() { _, _ = jwksFromCache(srv.URL, ttl) }()
+	waitFor(t, func() bool { return hits.Load() >= 2 })
+
+	const n = 16
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			_, err := jwksFromCache(srv.URL, ttl)
+			errs <- err
+		}()
+	}
+
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Errorf("request failed during a slow refresh: %v", err)
+			}
+		case <-deadline:
+			t.Fatalf("%d of %d requests still waiting on a slow JWKS refresh", n-i, n)
+		}
+	}
+
+	unblock()
+	if got := hits.Load(); got != 2 {
+		t.Errorf("JWKS endpoint hit %d times, want 2 (the initial fetch and one refresh)", got)
+	}
+}
+
+// TestParseRSAPublicKey_RejectsWeakKey covers degenerate moduli: a three-byte
+// n yields a 17-bit key that is trivially factorable.
+func TestParseRSAPublicKey_RejectsWeakKey(t *testing.T) {
+	t.Parallel()
+
+	if _, err := parseRSAPublicKey("AQAB", "AQAB"); err == nil {
+		t.Error("expected error for a 17-bit RSA modulus")
+	}
+
+	priv, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+	jwk := rsaJWK(t, "small", &priv.PublicKey)
+	if _, err := parseRSAPublicKey(jwk.N, jwk.E); err == nil {
+		t.Error("expected error for a 1024-bit RSA modulus")
+	}
+}
+
+// TestParseECDSAPublicKey_RejectsOffCurvePoint covers points that are not on
+// the named curve, which are not usable public keys.
+func TestParseECDSAPublicKey_RejectsOffCurvePoint(t *testing.T) {
+	t.Parallel()
+
+	enc := func(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+	if _, err := parseECDSAPublicKey("P-256", enc([]byte{1}), enc([]byte{2})); err == nil {
+		t.Error("expected error for a point that is not on P-256")
+	}
+}
+
+// TestJwksGetKeyHonoursUseAndAlg covers keys a JWKS publishes for a purpose
+// other than signature verification.
+func TestJwksGetKeyHonoursUseAndAlg(t *testing.T) {
+	t.Parallel()
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+
+	encKey := rsaJWK(t, "enc-1", &priv.PublicKey)
+	encKey.Use = "enc"
+	wrongAlg := rsaJWK(t, "alg-1", &priv.PublicKey)
+	wrongAlg.Alg = "ES256"
+	sigKey := rsaJWK(t, "sig-1", &priv.PublicKey)
+	sigKey.Use = "sig"
+	sigKey.Alg = "RS256"
+
+	set := &Jwks{Keys: []Jwk{encKey, wrongAlg, sigKey}}
+
+	if _, err := set.getKey("enc-1"); err == nil {
+		t.Error("expected error for a key published with use=enc")
+	}
+	if _, err := set.getKey("alg-1"); err == nil {
+		t.Error("expected error for an RSA key declaring alg=ES256")
+	}
+	if _, err := set.getKey("sig-1"); err != nil {
+		t.Errorf("getKey(sig-1): %v", err)
 	}
 }

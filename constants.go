@@ -24,10 +24,24 @@
 
 package okapi
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/jkaninda/njia"
+)
 
 const (
-	defaultMaxMemory       = 32 << 20 // 32 MB
+	defaultMaxMemory = 32 << 20 // 32 MB
+
+	// defaultReadHeaderTimeout bounds how long a client may take to send
+	// request headers, which is what a Slowloris client stretches out.
+	defaultReadHeaderTimeout = 10 // seconds
+	// defaultIdleTimeout bounds how long an idle keep-alive connection is held.
+	defaultIdleTimeout = 120 // seconds
+
+	// defaultMaxRequestBody caps the body the binders will read when no
+	// BodyLimit middleware is installed. Raise it with WithMaxRequestBody.
+	defaultMaxRequestBody  = 8 << 20 // 8 MB
 	constContentTypeHeader = "Content-Type"
 	constAcceptHeader      = "Accept"
 	constLocationHeader    = "Location"
@@ -71,6 +85,10 @@ const (
 	methodPost    = http.MethodPost
 	methodPut     = http.MethodPut
 	methodPatch   = http.MethodPatch
+	// methodAny is the router's method for a route that matches every method;
+	// methodAnyName is the spelling RouteDefinition.Method also accepts.
+	methodAny     = njia.MethodAny
+	methodAnyName = "ANY"
 )
 
 // Elliptic curve names as they appear in a JWK "crv" parameter.
@@ -173,7 +191,6 @@ const (
 	formatLatitude  = "latitude"
 	formatLongitude = "longitude"
 	// Special values
-	bodyValue = "body"
 	bodyField = "Body"
 
 	// Parameter locations

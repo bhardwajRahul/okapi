@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
@@ -116,19 +117,34 @@ func (c *Context) bindRequest(out any) error {
 		return errors.New("bind target must be a pointer to a struct")
 	}
 
-	// Decode body content based on content type (if any)
+	// Decode body content based on content type (if any). A request without a
+	// body is not an error: the other sources may still satisfy the struct.
 	switch contentType := c.ContentType(); {
 	case strings.Contains(contentType, constJSON):
-		_ = c.BindJSON(out) // ignore error for now
+		if err := bodyDecodeError("JSON", c.BindJSON(out)); err != nil {
+			return err
+		}
 	case strings.Contains(contentType, constXML):
-		_ = c.BindXML(out)
+		if err := bodyDecodeError("XML", c.BindXML(out)); err != nil {
+			return err
+		}
 	case strings.Contains(contentType, constYAML),
 		strings.Contains(contentType, constYamlX),
 		strings.Contains(contentType, constYamlText):
-		_ = c.BindYAML(out)
+		if err := bodyDecodeError("YAML", c.BindYAML(out)); err != nil {
+			return err
+		}
 	case strings.Contains(contentType, constPROTOBUF):
 		if msg, ok := out.(proto.Message); ok {
-			_ = c.BindProtoBuf(msg)
+			if err := bodyDecodeError("protobuf", c.BindProtoBuf(msg)); err != nil {
+				return err
+			}
+		}
+	case strings.Contains(contentType, constFormURLEncoded):
+		// Parse up front so a malformed or oversized body is reported instead
+		// of being read as empty form values
+		if err := c.parseForm(); err != nil {
+			return fmt.Errorf("invalid form data: %w", err)
 		}
 	case strings.Contains(contentType, constFormData):
 		// Handle multipart form data specially
@@ -144,9 +160,18 @@ func (c *Context) bindRequest(out any) error {
 	return validateStruct(out)
 }
 
+// bodyDecodeError wraps an error from decoding the request body. io.EOF means
+// the body was empty, which is not an error: there was nothing to decode.
+func bodyDecodeError(format string, err error) error {
+	if err == nil || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return fmt.Errorf("invalid %s body: %w", format, err)
+}
+
 // BindMultipart binds multipart form data to the provided struct.
 func (c *Context) BindMultipart(out any) error {
-	if err := c.request.ParseMultipartForm(c.okapi.maxMultipartMemory); err != nil {
+	if err := c.parseMultipartForm(); err != nil {
 		return fmt.Errorf("invalid multipart form: %w", err)
 	}
 
@@ -173,9 +198,32 @@ func (c *Context) bindMultipartField(field reflect.StructField, valField reflect
 	var wasSet bool
 	var err error
 
-	// Handle headers
-	if headerTag := field.Tag.Get(tagHeader); headerTag != "" {
-		wasSet, err = c.bindHeaderFieldWithStatus(headerTag, valField, field)
+	// Sources are tried in the same order as the other binders: param, path,
+	// query, form, header. The first one that sets the field wins.
+
+	// Handle path parameters
+	if paramTag := field.Tag.Get(tagParam); paramTag != "" {
+		wasSet, err = c.bindParamFieldWithStatus(paramTag, valField, field)
+		if err != nil {
+			return err
+		}
+		if wasSet {
+			return nil
+		}
+	}
+	if paramTag := field.Tag.Get(tagPath); paramTag != "" {
+		wasSet, err = c.bindParamFieldWithStatus(paramTag, valField, field)
+		if err != nil {
+			return err
+		}
+		if wasSet {
+			return nil
+		}
+	}
+
+	// Handle query parameters (including arrays)
+	if queryTag := field.Tag.Get(tagQuery); queryTag != "" {
+		wasSet, err = c.bindQueryFieldWithStatus(queryTag, valField, field)
 		if err != nil {
 			return err
 		}
@@ -206,29 +254,9 @@ func (c *Context) bindMultipartField(field reflect.StructField, valField reflect
 		}
 	}
 
-	// Handle query parameters (including arrays)
-	if queryTag := field.Tag.Get(tagQuery); queryTag != "" {
-		wasSet, err = c.bindQueryFieldWithStatus(queryTag, valField, field)
-		if err != nil {
-			return err
-		}
-		if wasSet {
-			return nil
-		}
-	}
-
-	// Handle path parameters
-	if paramTag := field.Tag.Get(tagParam); paramTag != "" {
-		wasSet, err = c.bindParamFieldWithStatus(paramTag, valField, field)
-		if err != nil {
-			return err
-		}
-		if wasSet {
-			return nil
-		}
-	}
-	if paramTag := field.Tag.Get(tagPath); paramTag != "" {
-		wasSet, err = c.bindParamFieldWithStatus(paramTag, valField, field)
+	// Handle headers
+	if headerTag := field.Tag.Get(tagHeader); headerTag != "" {
+		wasSet, err = c.bindHeaderFieldWithStatus(headerTag, valField, field)
 		if err != nil {
 			return err
 		}
@@ -303,7 +331,7 @@ func (c *Context) bindFileFieldWithStatus(tag string, valField reflect.Value, fi
 func (c *Context) bindMultipleFilesWithStatus(tag string, valField reflect.Value) (bool, error) {
 	// Get the multipart form
 	if c.request.MultipartForm == nil {
-		if err := c.request.ParseMultipartForm(c.okapi.maxMultipartMemory); err != nil {
+		if err := c.parseMultipartForm(); err != nil {
 			return false, fmt.Errorf("failed to parse multipart form: %w", err)
 		}
 	}
@@ -381,7 +409,7 @@ func (c *Context) bindFormFieldWithStatus(tag string, valField reflect.Value, fi
 func (c *Context) bindQueryFieldWithStatus(tag string, vf reflect.Value, fld reflect.StructField) (bool, error) {
 	// Parse query parameters if not already parsed
 	if c.request.Form == nil {
-		if err := c.request.ParseForm(); err != nil {
+		if err := c.parseForm(); err != nil {
 			return false, fmt.Errorf("failed to parse query parameters: %w", err)
 		}
 	}
@@ -460,6 +488,19 @@ func (c *Context) bindFromFields(out any) error {
 	v := reflect.ValueOf(out).Elem()
 	t := v.Type()
 
+	// Tag sources in precedence order: the first non-empty value wins, and
+	// cookies are only consulted after all of them
+	tagSources := []struct {
+		tag string
+		get func(string) string
+	}{
+		{tagParam, c.Param},
+		{tagPath, c.Param},
+		{tagQuery, c.Query},
+		{tagForm, c.FormValue},
+		{tagHeader, c.Header},
+	}
+
 	// Helper to try to set a field from a value source
 	trySet := func(valField reflect.Value, value string, field reflect.StructField) (bool, error) {
 		if value == "" {
@@ -486,19 +527,10 @@ func (c *Context) bindFromFields(out any) error {
 
 		wasSet := false
 
-		// Map of tag type → function returning value
-		tagSources := map[string]func(string) string{
-			tagParam:  c.Param,
-			tagPath:   c.Param,
-			tagQuery:  c.Query,
-			tagForm:   c.FormValue,
-			tagHeader: func(key string) string { return c.request.Header.Get(key) },
-		}
-
 		// Try each tag source
-		for tag, getter := range tagSources {
-			if tagVal := field.Tag.Get(tag); tagVal != "" {
-				set, err := trySet(valField, getter(tagVal), field)
+		for _, source := range tagSources {
+			if tagVal := field.Tag.Get(source.tag); tagVal != "" {
+				set, err := trySet(valField, source.get(tagVal), field)
 				if err != nil {
 					return err
 				}
@@ -554,20 +586,69 @@ func setValueWithValidation(field reflect.Value, value string, sf reflect.Struct
 	return fmt.Errorf("unsupported field type %s", field.Kind())
 }
 
+// limitedBody returns the request body bounded by the default request-body cap.
+//
+// Without it the binders read whatever a client sends: BodyLimit is opt-in, so
+// the default path was unbounded, and combined with the absence of a read
+// timeout that made memory pressure cheap to create. When BodyLimit is
+// installed it has already enforced its own limit and rebuffered the body, so
+// its configuration wins and nothing further is applied here.
+func (c *Context) limitedBody() io.Reader {
+	c.capBody()
+	return c.request.Body
+}
+
+// capBody installs the request-body cap over c.request.Body itself, so readers
+// that take the body straight from the request, such as the standard library's
+// form and multipart parsers, are held to the same limit as the decoders.
+func (c *Context) capBody() {
+	if c.bodyLimited || c.request.Body == nil || c.request.Body == http.NoBody {
+		return
+	}
+	if c.request.Body == c.cappedBody {
+		return
+	}
+
+	limit := int64(defaultMaxRequestBody)
+	if c.okapi != nil && c.okapi.maxRequestBody > 0 {
+		limit = c.okapi.maxRequestBody
+	}
+	c.request.Body = http.MaxBytesReader(c.response, c.request.Body, limit)
+	c.cappedBody = c.request.Body
+}
+
+// parseForm parses the query string and a url-encoded body within the
+// request-body cap.
+func (c *Context) parseForm() error {
+	c.capBody()
+	return c.request.ParseForm()
+}
+
+// parseMultipartForm parses a multipart body within the request-body cap, so an
+// oversized upload is rejected instead of being buffered or spilled to disk.
+func (c *Context) parseMultipartForm() error {
+	c.capBody()
+	maxMemory := int64(defaultMaxMemory)
+	if c.okapi != nil && c.okapi.maxMultipartMemory > 0 {
+		maxMemory = c.okapi.maxMultipartMemory
+	}
+	return c.request.ParseMultipartForm(maxMemory)
+}
+
 func (c *Context) BindJSON(v any) error {
-	return json.NewDecoder(c.request.Body).Decode(v)
+	return json.NewDecoder(c.limitedBody()).Decode(v)
 }
 
 func (c *Context) BindXML(v any) error {
-	return xml.NewDecoder(c.request.Body).Decode(v)
+	return xml.NewDecoder(c.limitedBody()).Decode(v)
 }
 
 func (c *Context) BindYAML(v any) error {
-	return yaml.NewDecoder(c.request.Body).Decode(v)
+	return yaml.NewDecoder(c.limitedBody()).Decode(v)
 }
 
 func (c *Context) BindProtoBuf(v proto.Message) error {
-	body, err := io.ReadAll(c.request.Body)
+	body, err := io.ReadAll(c.limitedBody())
 	if err != nil {
 		return fmt.Errorf("failed to read request body: %w", err)
 	}
@@ -581,14 +662,14 @@ func (c *Context) BindProtoBuf(v proto.Message) error {
 }
 
 func (c *Context) BindQuery(v any) error {
-	if err := c.request.ParseForm(); err != nil {
+	if err := c.parseForm(); err != nil {
 		return fmt.Errorf("invalid query data: %w", err)
 	}
 	return formToStruct(c.request.Form, v)
 }
 
 func (c *Context) BindForm(v any) error {
-	if err := c.request.ParseForm(); err != nil {
+	if err := c.parseForm(); err != nil {
 		return fmt.Errorf("invalid form data: %w", err)
 	}
 	return formToStruct(c.request.Form, v)
@@ -634,10 +715,8 @@ func validateStruct(v any) error {
 		if checkConditionalRequired(val, field, sf) {
 			return fmt.Errorf("field %s is required", sf.Name)
 		}
-		for _, check := range fieldConstraintCheckers {
-			if err := check(field, sf); err != nil {
-				return fmt.Errorf("field %s: %w", sf.Name, err)
-			}
+		if err := checkFieldConstraints(field, sf); err != nil {
+			return fmt.Errorf("field %s: %w", sf.Name, err)
 		}
 	}
 	return nil

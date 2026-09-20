@@ -38,6 +38,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -74,10 +75,14 @@ type (
 		logger              *slog.Logger
 		renderer            Renderer
 		corsEnabled         bool
+		corsMiddleware      bool
 		cors                Cors
 		writeTimeout        int
 		readTimeout         int
 		idleTimeout         int
+		readHeaderTimeout   int
+		trustedProxies      []*net.IPNet
+		maxRequestBody      int64
 		optionsRegistered   map[string]bool
 		openapiSpec         *openapi3.T
 		openapiSpec31       *openapi3.T
@@ -89,6 +94,14 @@ type (
 		noRoute             HandlerFunc
 		noMethod            HandlerFunc
 		errorHandler        ErrorHandler
+		// optionsHandlers holds user-registered OPTIONS routes on paths whose
+		// OPTIONS method is already served by the CORS preflight handler.
+		optionsHandlers map[string]http.HandlerFunc
+		// lifecycleMu guards server, tlsServer, baseCancel and shutdownCh, which
+		// StartServer and StopWithContext touch from different goroutines.
+		lifecycleMu sync.Mutex
+		// shutdownCh is closed when a graceful shutdown begins.
+		shutdownCh chan struct{}
 	}
 
 	Router struct {
@@ -129,6 +142,9 @@ type (
 		internal        bool
 		handle          HandlerFunc
 		cookies         []*openapi3.ParameterRef
+		// group is the group the route was registered on, if any. Its
+		// middlewares and disabled state are read at dispatch time.
+		group *Group
 	}
 
 	// ResponseWriter extends http.ResponseWriter with additional utilities.
@@ -201,12 +217,11 @@ func (r *Route) Enable() *Route {
 	return r
 }
 
-// setDisabled sets the disabled state of the Route.
-// When disabled is true, the route returns 404 Not Found.
-// Returns the Route to allow method chaining.
-func (r *Route) setDisabled(disabled bool) *Route {
-	r.disabled = disabled
-	return r
+// disabledRoute is the RouteOption behind RouteDefinition.Disabled.
+func disabledRoute() RouteOption {
+	return func(r *Route) {
+		r.disabled = true
+	}
 }
 
 // Deprecated marks the Route as deprecated.
@@ -356,11 +371,24 @@ func WithLogger(logger *slog.Logger) OptionFunc {
 	}
 }
 
-// WithCors returns an OptionFunc that configures CORS settings
+// WithCors returns an OptionFunc that configures CORS settings.
+//
+// It both registers the per-path OPTIONS preflight handler and installs
+// Cors.CORSHandler in the middleware chain, so actual responses carry
+// Access-Control-Allow-Origin too. Registering only the preflight handler —
+// as this option previously did — produces a preflight that says yes followed
+// by a response the browser blocks for having no CORS headers.
 func WithCors(cors Cors) OptionFunc {
 	return func(o *Okapi) {
 		o.corsEnabled = true
 		o.cors = cors
+
+		if !o.corsMiddleware {
+			o.corsMiddleware = true
+			// Read o.cors at call time so a later WithCors replaces the
+			// configuration rather than stacking a second handler.
+			o.Use(func(c *Context) error { return o.cors.CORSHandler(c) })
+		}
 	}
 }
 
@@ -377,6 +405,56 @@ func WithReadTimeout(t int) OptionFunc {
 	return func(o *Okapi) {
 		o.readTimeout = t
 		o.server.ReadTimeout = secondsToDuration(t)
+	}
+}
+
+// WithReadHeaderTimeout returns an OptionFunc that sets how long the server
+// waits for a request's headers. Zero means no limit.
+func WithReadHeaderTimeout(t int) OptionFunc {
+	return func(o *Okapi) {
+		o.readHeaderTimeout = t
+		o.server.ReadHeaderTimeout = secondsToDuration(t)
+	}
+}
+
+// WithTrustedProxies configures which peers may set the X-Forwarded-For and
+// X-Real-IP headers that RealIP reads.
+//
+// Entries are CIDR blocks ("10.0.0.0/8") or bare addresses ("192.0.2.7"). When
+// configured, those headers are honoured only for connections originating from
+// one of them, and ignored otherwise; RealIP then falls back to the connection
+// address. Passing no entries restores the default of trusting the headers
+// unconditionally, which is spoofable by any client.
+//
+// A configuration containing an invalid entry is rejected as a whole and logged
+// as an error; no peer is trusted until it is corrected, so the headers are
+// ignored and RealIP returns the connection address. A malformed configuration
+// therefore cannot silently widen what is trusted.
+func WithTrustedProxies(cidrs ...string) OptionFunc {
+	return func(o *Okapi) {
+		if len(cidrs) == 0 {
+			o.trustedProxies = nil
+			return
+		}
+		networks, err := parseCIDRs(cidrs)
+		if err != nil {
+			o.logger.Error("Invalid trusted proxy configuration; trusting no proxies", "error", err)
+			o.trustedProxies = []*net.IPNet{}
+			return
+		}
+		o.trustedProxies = networks
+	}
+}
+
+// WithMaxRequestBody sets the largest request body the binders will read when
+// no BodyLimit middleware is installed. Defaults to 8 MB; zero or negative
+// restores the default.
+//
+// BodyLimit, where installed, takes precedence: it has already bounded the
+// body by the time a binder runs.
+func WithMaxRequestBody(bytes int64) OptionFunc {
+	return func(o *Okapi) {
+		o.maxRequestBody = bytes
 	}
 }
 
@@ -521,6 +599,18 @@ func (o *Okapi) WithReadTimeout(seconds int) *Okapi {
 
 func (o *Okapi) WithIdleTimeout(seconds int) *Okapi {
 	return o.apply(WithIdleTimeout(seconds))
+}
+
+func (o *Okapi) WithReadHeaderTimeout(seconds int) *Okapi {
+	return o.apply(WithReadHeaderTimeout(seconds))
+}
+
+func (o *Okapi) WithTrustedProxies(cidrs ...string) *Okapi {
+	return o.apply(WithTrustedProxies(cidrs...))
+}
+
+func (o *Okapi) WithMaxRequestBody(bytes int64) *Okapi {
+	return o.apply(WithMaxRequestBody(bytes))
 }
 
 func (o *Okapi) WithStrictSlash(strict bool) *Okapi {
@@ -806,7 +896,17 @@ func (o *Okapi) With(options ...OptionFunc) *Okapi {
 
 	o.apply(options...)
 
-	o.applyServerConfig(o.server)
+	// With may be called on a running server; StartServer publishes o.server
+	// under the lifecycle lock, and Stop clears it.
+	o.lifecycleMu.Lock()
+	server := o.server
+	o.lifecycleMu.Unlock()
+	if server != nil {
+		if o.tlsConfig != nil && server.TLSConfig != o.tlsConfig {
+			server.TLSConfig = o.tlsConfig
+		}
+		o.applyServerConfig(server)
+	}
 
 	if o.tlsServerConfig != nil {
 		o.tlsServer.TLSConfig = o.tlsServerConfig
@@ -878,7 +978,7 @@ func (o *Okapi) UseMiddleware(mw func(http.Handler) http.Handler) {
 			// Continue the Okapi middleware chain
 			c.request = r
 			if err := c.Next(); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				o.handleChainError(c, err)
 			}
 		})
 
@@ -898,12 +998,10 @@ func (o *Okapi) StartServer(server *http.Server) error {
 	if o.openApiEnabled {
 		o.WithOpenAPIDocs()
 	}
-	o.server = server
 	server.Handler = o
 
 	// Set BaseContext so all request contexts derive from a cancellable parent.
 	baseCtx, baseCancel := context.WithCancel(context.Background())
-	o.baseCancel = baseCancel
 	server.BaseContext = func(_ net.Listener) context.Context {
 		return baseCtx
 	}
@@ -911,7 +1009,17 @@ func (o *Okapi) StartServer(server *http.Server) error {
 	o.router.njia.RedirectTrailingSlash = o.strictSlash
 	o.context.okapi = o
 	o.applyCommon()
+
+	// Stop may run on another goroutine as soon as Start is called, so the
+	// fields it reads are published under the lifecycle lock.
+	o.lifecycleMu.Lock()
+	o.server = server
+	o.baseCancel = baseCancel
+	o.shutdownCh = make(chan struct{})
+	tlsServer := o.tlsServer
 	o.printServerInfo()
+	o.lifecycleMu.Unlock()
+
 	// Serve with TLS if configured
 	if server.TLSConfig != nil {
 		return server.ListenAndServeTLS("", "")
@@ -926,9 +1034,9 @@ func (o *Okapi) StartServer(server *http.Server) error {
 			}
 		}()
 
-		o.tlsServer.Handler = o
-		o.tlsServer.BaseContext = server.BaseContext
-		return o.tlsServer.ListenAndServeTLS("", "")
+		tlsServer.Handler = o
+		tlsServer.BaseContext = server.BaseContext
+		return tlsServer.ListenAndServeTLS("", "")
 	}
 
 	// Default HTTP only
@@ -944,12 +1052,16 @@ func (o *Okapi) Stop() error {
 func (o *Okapi) StopWithContext(ctx context.Context) error {
 	shutdownCtx := o.resolveContext(ctx)
 
-	if err := o.shutdownServer(shutdownCtx, o.server, "HTTP"); err != nil {
+	o.lifecycleMu.Lock()
+	server, tlsServer := o.server, o.tlsServer
+	o.lifecycleMu.Unlock()
+
+	if err := o.shutdownServer(shutdownCtx, server, "HTTP"); err != nil {
 		return err
 	}
 
 	if o.withTlsServer && o.tlsServerConfig != nil {
-		if err := o.shutdownServer(shutdownCtx, o.tlsServer, "HTTPS"); err != nil {
+		if err := o.shutdownServer(shutdownCtx, tlsServer, "HTTPS"); err != nil {
 			return err
 		}
 	}
@@ -965,22 +1077,58 @@ func (o *Okapi) shutdownServer(ctx context.Context, server *http.Server, serverT
 
 	_, _ = fmt.Fprintf(defaultWriter, "[Okapi] Gracefully shutting down %s server at %s\n", serverType, server.Addr)
 
-	// Cancel the base context to notify all in-flight requests (including SSE streams)
-	if o.baseCancel != nil {
-		o.baseCancel()
+	o.lifecycleMu.Lock()
+	if o.shutdownCh != nil {
+		select {
+		case <-o.shutdownCh:
+		default:
+			close(o.shutdownCh)
+		}
 	}
+	baseCancel := o.baseCancel
+	o.lifecycleMu.Unlock()
 
-	if err := server.Shutdown(ctx); err != nil {
+	err := server.Shutdown(ctx)
+	// Cancel whether or not draining completed, so requests still running
+	// after the deadline observe cancellation.
+	if baseCancel != nil {
+		baseCancel()
+	}
+	if err != nil {
 		return fmt.Errorf("%s shutdown error at %s: %w", serverType, server.Addr, err)
 	}
 	// Clear the server
+	o.lifecycleMu.Lock()
 	if serverType == "HTTP" {
 		o.server = nil
 	} else {
 		o.tlsServer = nil
 	}
+	o.lifecycleMu.Unlock()
 
 	return nil
+}
+
+// serverAddr returns the HTTP server's address, or "" when there is no server.
+func (o *Okapi) serverAddr() string {
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
+	if o.server == nil {
+		return ""
+	}
+	return o.server.Addr
+}
+
+// shuttingDown returns a channel that is closed when a graceful shutdown
+// begins, or nil when the server has not been started. Receiving from a nil
+// channel blocks forever, so callers can select on it unconditionally.
+func (o *Okapi) shuttingDown() <-chan struct{} {
+	if o == nil {
+		return nil
+	}
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
+	return o.shutdownCh
 }
 
 // resolveContext returns the most appropriate context to use.
@@ -1011,7 +1159,19 @@ func (o *Okapi) Shutdown(server *http.Server, ctx ...context.Context) error {
 	return server.Shutdown(shutdownCtx)
 }
 
-// GetContext returns the current context
+// GetContext returns the application-level Context.
+//
+// This is NOT the context of the request being handled. It is a single
+// instance created with the application, shared by every goroutine: its
+// request is an empty *http.Request and anything stored on it with Set is
+// visible process-wide, concurrently. Since the store is also where forwarded
+// JWT claims land, using this where a request Context was meant leaks identity
+// between users.
+//
+// Handlers already receive their own request-scoped *Context; use that.
+//
+// Deprecated: use the *Context passed to the handler. This accessor exists for
+// application-level setup and will be removed.
 func (o *Okapi) GetContext() *Context {
 	return o.context
 }
@@ -1144,11 +1304,11 @@ func (o *Okapi) Head(path string, h HandlerFunc, opts ...RouteOption) *Route {
 //
 // Example:
 //
-//	o.Any("/health", func(c okapi.Context) error {
+//	o.Any("/health", func(c *okapi.Context) error {
 //	    return c.String(200, "OK")
 //	})
 func (o *Okapi) Any(path string, h HandlerFunc, opts ...RouteOption) *Route {
-	return o.addRoute("", path, nil, h, opts...)
+	return o.addRoute(njia.MethodAny, path, nil, h, opts...)
 }
 
 // ********** Static Content ***************
@@ -1166,9 +1326,9 @@ func (o *Okapi) StaticFile(path string, filepath string) {
 	}))
 }
 
-// StaticFS serves static files from a custom http.FileSystem (e.g., embed.FS).
+// StaticFS serves static files from a custom http.FileSystem (e.g., embed.FS), without directory listing
 func (o *Okapi) StaticFS(prefix string, fs http.FileSystem) {
-	fileServer := http.StripPrefix(prefix, http.FileServer(fs))
+	fileServer := http.StripPrefix(prefix, http.FileServer(noDirListing{fs}))
 	o.mountPrefix(prefix, o.dispatchThroughChain(fileServer.ServeHTTP), http.MethodGet)
 }
 
@@ -1193,27 +1353,49 @@ func (o *Okapi) addRoute(method, path string, tags []string, h HandlerFunc, opts
 		opt(route)
 	}
 	o.routes = append(o.routes, route)
-	// Main handler
-	o.mustRegister(method, normalizedPath, func(w http.ResponseWriter, r *http.Request) {
-		ctx := NewContext(o, w, r)
-		// if the route is disabled, return 404 Not Found
-		if route.disabled {
-			http.Error(ctx.response, "404 Not Found", http.StatusNotFound)
-			return
-		}
-		// Build the handler chain: global middlewares + route middlewares + handler
-		ctx.handlers = route.buildHandlers()
-		ctx.index = -1
-		// Any error returned by the route will result in a 500 Internal Server Error
-		if err := ctx.Next(); err != nil {
-			if ctx.response.StatusCode() == 0 {
-				http.Error(ctx.response, err.Error(), http.StatusInternalServerError)
-			}
-		}
-	})
+	if method == http.MethodOptions {
+		o.registerUserOptions(normalizedPath, o.routeHandler(route))
+		return route
+	}
+	o.mustRegister(method, normalizedPath, o.routeHandler(route))
 	// Register OPTIONS handler only once per path if CORS is enabled
 	o.registerOptionsHandler(normalizedPath)
 	return route
+}
+
+// routeHandler dispatches a request to route through the global, group and
+// route middlewares.
+func (o *Okapi) routeHandler(route *Route) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := NewContext(o, w, r)
+		// if the route or one of its groups is disabled, return 404 Not Found
+		if route.isDisabled() {
+			http.Error(ctx.response, "404 Not Found", http.StatusNotFound)
+			return
+		}
+		// Build the handler chain: global middlewares + group middlewares + route middlewares + handler
+		ctx.handlers = route.buildHandlers()
+		ctx.index = -1
+		if err := ctx.Next(); err != nil {
+			o.handleChainError(ctx, err)
+		}
+	}
+}
+
+// registerUserOptions registers a user-defined OPTIONS route. When the CORS
+// preflight handler already serves OPTIONS on the path, the route is handed to
+// that handler for requests that are not preflights instead of being
+// registered twice.
+func (o *Okapi) registerUserOptions(path string, h http.HandlerFunc) {
+	if _, exists := o.optionsHandlers[path]; exists {
+		panic(fmt.Sprintf("okapi: cannot register route %s %s: duplicate route", http.MethodOptions, path))
+	}
+	o.optionsHandlers[path] = h
+	if o.optionsRegistered[path] {
+		return
+	}
+	o.optionsRegistered[path] = true
+	o.mustRegister(http.MethodOptions, path, h)
 }
 
 // Handle registers a new route with the given HTTP method, path, and Okapi-style handler function.
@@ -1300,22 +1482,46 @@ func (o *Okapi) registerOptionsHandler(path string) {
 		o.optionsRegistered[path] = true
 
 		o.mustRegister(http.MethodOptions, path, func(w http.ResponseWriter, r *http.Request) {
-			origin := r.Header.Get("Origin")
-			if origin == "" || !originAllowed(o.cors.AllowedOrigins, origin) {
+			// A request that is not a preflight belongs to a user-registered
+			// OPTIONS route on the path, if there is one.
+			if r.Header.Get("Access-Control-Request-Method") == "" {
+				if h := o.optionsHandlers[path]; h != nil {
+					h(w, r)
+					return
+				}
+				// An Any route on the path answers every method, OPTIONS included.
+				for _, route := range o.routes {
+					if route.Path == path && route.Method == njia.MethodAny {
+						o.routeHandler(route)(w, r)
+						return
+					}
+				}
+			}
+			addVary(w.Header(), "Origin")
+
+			cors := o.cors
+			allowed, ok := cors.resolveOrigin(r.Header.Get("Origin"))
+			if !ok {
 				http.Error(w, "", http.StatusMethodNotAllowed)
 				return
 			}
 
-			cors := o.cors
-
 			if len(cors.AllowMethods) == 0 {
 				for _, route := range o.routes {
-					if route.Path == path {
-						cors.AllowMethods = append(cors.AllowMethods, route.Method)
+					if route.Path != path {
+						continue
 					}
+					if route.Method == njia.MethodAny {
+						// "*" is not a method name; list what an Any route serves.
+						cors.AllowMethods = append(cors.AllowMethods, http.MethodGet, http.MethodHead,
+							http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions)
+						continue
+					}
+					cors.AllowMethods = append(cors.AllowMethods, route.Method)
 				}
+				cors.AllowMethods = goutils.RemoveDuplicates(cors.AllowMethods)
 			}
-			cors.writeHeaders(w.Header(), r, true)
+			cors.writeHeaders(w.Header(), r, allowed, true)
 
 			w.WriteHeader(http.StatusNoContent)
 		})
@@ -1342,15 +1548,28 @@ func (o *Okapi) globalMiddlewares() []Middleware {
 }
 
 // buildHandlers constructs the full handler chain for a route:
-// global middlewares + route middlewares + final handler.
+// global middlewares + group middlewares + route middlewares + final handler.
+// Group middlewares are read here, per request, so Group.Use applies to routes
+// registered before it was called.
 func (r *Route) buildHandlers() []HandlerFunc {
 	global := r.chain.globalMiddlewares()
-	handlers := make([]HandlerFunc, 0, len(global)+len(r.middlewares)+1)
+	var grouped []Middleware
+	if r.group != nil {
+		grouped = r.group.chainMiddlewares()
+	}
+	handlers := make([]HandlerFunc, 0, len(global)+len(grouped)+len(r.middlewares)+1)
 	handlers = append(handlers, global...)
+	handlers = append(handlers, grouped...)
 	handlers = append(handlers, r.middlewares...)
 	handlers = append(handlers, r.handle)
 	return handlers
 }
+
+// isDisabled reports whether the route, or a group it belongs to, is disabled.
+func (r *Route) isDisabled() bool {
+	return r.disabled || (r.group != nil && r.group.isDisabled())
+}
+
 func (o *Okapi) Routes() []Route {
 	routes := make([]Route, 0, len(o.routes))
 	for _, route := range o.routes {
@@ -1378,18 +1597,22 @@ func (o *Okapi) Group(prefix string, middlewares ...Middleware) *Group {
 	if len(prefix) == 0 {
 		panic("Group prefix cannot be empty")
 	}
-	group := &Group{
-		Prefix:      prefix,
-		okapi:       o,
-		middlewares: middlewares,
-	}
-	return group
+	// newGroup copies the slice: keeping the caller's would let Use on one
+	// group append into another group built from the same slice.
+	return newGroup(prefix, false, o, middlewares...)
 }
 
 // initConfig initializes a new Okapi instance.
 func initConfig(options ...OptionFunc) *Okapi {
+	// Every timeout on a zero-valued http.Server means "no limit": a Slowloris
+	// client dribbling headers holds a connection and its goroutine
+	// indefinitely. ReadHeaderTimeout and IdleTimeout are conservative enough
+	// to default; ReadTimeout and WriteTimeout are left unset because a
+	// default there would cut off legitimate uploads and streaming responses.
 	server := &http.Server{
-		Addr: defaultAddr,
+		Addr:              defaultAddr,
+		ReadHeaderTimeout: secondsToDuration(defaultReadHeaderTimeout),
+		IdleTimeout:       secondsToDuration(defaultIdleTimeout),
 	}
 
 	o := &Okapi{
@@ -1403,8 +1626,11 @@ func initConfig(options ...OptionFunc) *Okapi {
 		tlsServer:          &http.Server{},
 		logger:             slog.Default(),
 		accessLog:          true,
+		idleTimeout:        defaultIdleTimeout,
+		readHeaderTimeout:  defaultReadHeaderTimeout,
 		middlewares:        []Middleware{handleAccessLog},
 		optionsRegistered:  make(map[string]bool),
+		optionsHandlers:    make(map[string]http.HandlerFunc),
 		maxMultipartMemory: defaultMaxMemory,
 		cors:               Cors{},
 		ctx:                context.Background(),
@@ -1424,11 +1650,25 @@ func initConfig(options ...OptionFunc) *Okapi {
 	return o.With(options...)
 }
 
-// applyServerConfig sets common server timeout and keep-alive configurations
+// applyServerConfig fills the server's timeout and keep-alive settings that are
+// still zero. Timeouts already set on the server are kept: the With*Timeout
+// options write theirs to the server directly, and a server passed through
+// WithServer carries the values its owner chose.
+//
+// Fields are written only when the value changes, so calling With on a running
+// server does not race with net/http reading them.
 func (o *Okapi) applyServerConfig(s *http.Server) {
-	s.ReadTimeout = secondsToDuration(o.readTimeout)
-	s.WriteTimeout = secondsToDuration(o.writeTimeout)
-	s.IdleTimeout = secondsToDuration(o.idleTimeout)
+	fill := func(field *time.Duration, seconds int) {
+		if *field == 0 {
+			if d := secondsToDuration(seconds); d != 0 {
+				*field = d
+			}
+		}
+	}
+	fill(&s.ReadTimeout, o.readTimeout)
+	fill(&s.WriteTimeout, o.writeTimeout)
+	fill(&s.IdleTimeout, o.idleTimeout)
+	fill(&s.ReadHeaderTimeout, o.readHeaderTimeout)
 }
 
 // apply is a helper method to apply an OptionFunc to the Okapi instance
@@ -1537,10 +1777,29 @@ func (o *Okapi) dispatchThroughChain(next http.HandlerFunc) http.HandlerFunc {
 		ctx.handlers = handlers
 		ctx.index = -1
 		if err := ctx.Next(); err != nil {
-			if ctx.response.StatusCode() == 0 {
-				http.Error(ctx.response, err.Error(), http.StatusInternalServerError)
-			}
+			o.handleChainError(ctx, err)
 		}
+	}
+}
+
+// handleChainError answers a request whose handler chain returned an error.
+//
+// The error is logged, never sent to the client: its text routinely carries
+// internals such as driver messages, hostnames or file paths. If nothing has
+// been written yet, the configured ErrorHandler writes a 500 with a generic
+// message; handlers that want a specific status or message should respond
+// with the Abort* helpers instead of returning the error.
+func (o *Okapi) handleChainError(c *Context, err error) {
+	o.logger.Error("handler returned an error",
+		slog.String("method", c.request.Method),
+		slog.String("path", c.request.URL.Path),
+		slog.String("error", err.Error()))
+	if c.response.StatusCode() != 0 {
+		return
+	}
+	code := http.StatusInternalServerError
+	if herr := c.getContextErrorHandler()(c, code, http.StatusText(code), nil); herr != nil {
+		o.logger.Error("error handler failed", slog.String("error", herr.Error()))
 	}
 }
 
@@ -1548,9 +1807,7 @@ func (o *Okapi) wrapHandleFunc(h HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := NewContext(o, w, r)
 		if err := h(ctx); err != nil {
-			o.logger.Error("handler error", slog.String("error", err.Error()))
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-
+			o.handleChainError(ctx, err)
 		}
 	})
 }
@@ -1661,7 +1918,7 @@ func (o *Okapi) printRoutes() {
 
 	// Print routes
 	for _, route := range routes {
-		if route.hidden || route.disabled {
+		if route.hidden || route.isDisabled() {
 			continue // Skip hidden/disabled routes
 		}
 

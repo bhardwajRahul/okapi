@@ -88,13 +88,35 @@ type (
 		// Optional.
 		JwksUrl string
 
-		// Audience is the expected "aud" (audience) claim in the token.
+		// JwksCacheTTL is how long a key set fetched from JwksUrl is reused
+		// before the endpoint is consulted again. Defaults to 15 minutes.
+		//
+		// The set is cached because the key function runs on every token
+		// validation: fetching per request lets unauthenticated traffic drive
+		// one outbound request to the identity provider per inbound request.
+		// A kid missing from the cached set still triggers a rate-limited
+		// refresh, so key rotation is picked up without waiting out the TTL.
 		// Optional.
+		JwksCacheTTL time.Duration
+
+		// Audience is the expected "aud" (audience) claim in the token.
+		// Optional. When empty, the "aud" claim is not checked and tokens are
+		// accepted whether or not they carry one.
 		Audience string
 
 		// Issuer is the expected "iss" (issuer) claim in the token.
-		// Optional.
+		// Optional. When empty, the "iss" claim is not checked and tokens are
+		// accepted whether or not they carry one.
 		Issuer string
+
+		// AllowMissingExpiry accepts tokens that carry no "exp" claim.
+		//
+		// By default an "exp" claim is required, because a signed token without
+		// one never expires and the middleware has no revocation path: any such
+		// token that leaks stays valid until the signing key is rotated. Set
+		// this only for issuers that deliberately mint non-expiring tokens.
+		// Optional.
+		AllowMissingExpiry bool
 
 		// RsaKey is a public RSA key used to verify tokens signed with RS256.
 		// Optional.
@@ -151,8 +173,13 @@ type (
 		// Supported functions:
 		//   - Equals(field, value)
 		//   - Prefix(field, prefix)
-		//   - Contains(field, val1, val2, ...)
+		//   - Contains(field, val1, val2, ...)  — claim equals one of the
+		//     values, or an array claim has an element equal to one of them
 		//   - OneOf(field, val1, val2, ...)
+		//   - Substring(field, val1, val2, ...) — claim contains one of the
+		//     values as a substring. Not suitable for authorization: any
+		//     user-influenced part of a role or scope can be made to contain
+		//     the value being checked for.
 		//
 		// Logical Operators:
 		//   - !   — NOT
@@ -167,8 +194,6 @@ type (
 		//   - The expression ensures the user is verified AND either has an admin/owner role,
 		//     OR belongs to a premium tag group.
 		ClaimsExpression string
-		// parsedExpression holds the compiled version of ClaimsExpression.
-		parsedExpression Expression
 		// ValidateClaims is an optional custom validation function for processing JWT claims.
 		// This provides full control over claim validation logic and can be used alongside or
 		// instead of ClaimsExpression.
@@ -244,13 +269,16 @@ func LoggerMiddleware(c *Context) error {
 // It returns 401 Unauthorized and sets the WWW-Authenticate header on failure.
 func (b *BasicAuth) Middleware(c *Context) error {
 	username, password, ok := c.request.BasicAuth()
-	if !ok ||
-		subtle.ConstantTimeCompare([]byte(username), []byte(b.Username)) != 1 ||
-		subtle.ConstantTimeCompare([]byte(password), []byte(b.Password)) != 1 {
-
+	userMatch := subtle.ConstantTimeCompare([]byte(username), []byte(b.Username))
+	passMatch := subtle.ConstantTimeCompare([]byte(password), []byte(b.Password))
+	configured := b.Username != "" && b.Password != ""
+	if !ok || !configured || userMatch&passMatch != 1 {
 		realm := b.Realm
 		if realm == "" {
 			realm = okapiName
+		}
+		if !configured {
+			c.Logger().Error("Basic Authentication has an empty username or password configured; rejecting request", "realm", realm)
 		}
 		c.Logger().Warn("Basic Authentication Required", "ip", c.RealIP(), "realm", realm)
 		c.response.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
@@ -289,83 +317,23 @@ func (b BodyLimit) Middleware(c *Context) error {
 
 	// Reset request body for downstream handlers
 	c.request.Body = io.NopCloser(bytes.NewReader(body))
+	c.bodyLimited = true
 	return c.Next()
 }
 
 // Middleware validates JWT tokens from the configured source
 func (jwtAuth *JWTAuth) Middleware(c *Context) error {
-	tokenStr, err := jwtAuth.extractToken(c)
-	if err != nil || tokenStr == "" {
-		c.Logger().Debug("Failed to extract token", "error", err, "ip", c.RealIP())
-		c.Logger().Warn("Failed to extract token", "error", err, "ip", c.RealIP())
+	token, authErr := jwtAuth.authenticate(c)
+	if authErr != nil {
+
+		c.Logger().Warn(authErr.logMsg, "ip", c.RealIP(), "error", authErr.err)
 		if jwtAuth.OnUnauthorized != nil {
 			return jwtAuth.OnUnauthorized(c)
 		}
-		return c.AbortUnauthorized("Missing or invalid token", err)
-	}
-
-	keyFunc, err := jwtAuth.resolveKeyFunc()
-	if err != nil {
-		c.Logger().Warn("Failed to resolve key function", "ip", c.RealIP(), "error", err)
-		c.Logger().Debug("Failed to resolve key function", "ip", c.RealIP(), "token", tokenStr, "error", err)
-		return c.AbortUnauthorized("Invalid token")
-
-	}
-	validMethods := jwtAlgo
-	if len(jwtAuth.Algorithms) > 0 {
-		validMethods = jwtAuth.Algorithms
-	} else if jwtAuth.Algo != "" {
-		validMethods = []string{jwtAuth.Algo}
-	}
-	token, err := jwt.Parse(tokenStr, keyFunc,
-		jwt.WithValidMethods(validMethods),
-		jwt.WithAudience(jwtAuth.Audience),
-		jwt.WithIssuer(jwtAuth.Issuer))
-	if err != nil || !token.Valid {
-		if jwtAuth.OnUnauthorized != nil {
-			return jwtAuth.OnUnauthorized(c)
+		if authErr.status == http.StatusForbidden {
+			return c.AbortForbidden(authErr.message)
 		}
-		return c.AbortUnauthorized("Invalid or expired token", err)
-	}
-
-	// If claims expression is configured, validate the claims
-	if jwtAuth.ClaimsExpression != "" {
-		valid, err := jwtAuth.validateJWTClaims(token)
-		if err != nil {
-			c.Logger().Warn("Failed to validate JWT claims expression", "error", err)
-			if jwtAuth.OnUnauthorized != nil {
-				return jwtAuth.OnUnauthorized(c)
-			}
-			return c.AbortUnauthorized("failed to validate authentication permissions", err)
-		}
-		if !valid {
-			c.Logger().Warn("JWT claims did not meet required expression ", "error", err)
-			if jwtAuth.OnUnauthorized != nil {
-				return jwtAuth.OnUnauthorized(c)
-			}
-			return c.AbortForbidden("Insufficient permissions", err)
-		}
-	}
-	// If custom claims validation function is provided, use it
-	if jwtAuth.ValidateClaims != nil {
-		if err = jwtAuth.ValidateClaims(c, token.Claims); err != nil {
-			c.Logger().Warn("Failed to validate Claims Expression", "function", "ValidateClaims", "error", err)
-			c.Logger().Debug("Failed to validate Claims Expression", "function", "ValidateClaims", "expression", jwtAuth.ClaimsExpression, "error", err)
-			if jwtAuth.OnUnauthorized != nil {
-				return jwtAuth.OnUnauthorized(c)
-			}
-			return c.AbortForbidden("Insufficient permissions")
-		}
-	}
-	// If ValidateRole is configured, validate the role claim
-	if jwtAuth.ValidateRole != nil {
-		if err = jwtAuth.ValidateRole(token.Claims); err != nil {
-			c.Logger().Warn("Failed to validate JWT role", "function", "ValidateRole", "error", err)
-			if jwtAuth.OnUnauthorized != nil {
-				return jwtAuth.OnUnauthorized(c)
-			}
-			return c.AbortForbidden("Insufficient permissions", err)
-		}
+		return c.AbortUnauthorized(authErr.message)
 	}
 	// Store claims in context
 	if jwtAuth.ContextKey != "" && token.Claims != nil {
@@ -373,7 +341,7 @@ func (jwtAuth *JWTAuth) Middleware(c *Context) error {
 	}
 	// Forward specific claims to context if configured
 	if jwtAuth.ForwardClaims != nil {
-		if err = jwtAuth.forwardContextFromClaims(token, c); err != nil {
+		if err := jwtAuth.forwardContextFromClaims(token, c); err != nil {
 			c.Logger().Error("Failed to forward context from claims", "error", err)
 		}
 	}

@@ -26,7 +26,9 @@ package okapi
 
 import (
 	"errors"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -158,19 +160,49 @@ func TestPrefixExpr(t *testing.T) {
 
 // ContainsExpr
 
-func TestContainsExpr_Substring(t *testing.T) {
+func TestContainsExpr_MatchesByEquality(t *testing.T) {
 	t.Parallel()
 
 	claims := sampleClaims()
 
-	got, err := Contains("name", "Jane").Evaluate(claims)
+	got, err := Contains("name", "Jane Doe").Evaluate(claims)
+	if err != nil || !got {
+		t.Errorf("equal value: got (%v, %v), want (true, nil)", got, err)
+	}
+
+	// A single value is a membership test, not a substring test: matching a
+	// fragment of a role or scope is a privilege-escalation path wherever any
+	// part of the claim is user-influenced.
+	got, err = Contains("name", "Jane").Evaluate(claims)
+	if err != nil || got {
+		t.Errorf("substring of value: got (%v, %v), want (false, nil)", got, err)
+	}
+
+	got, err = Contains("role", "admin").Evaluate(jwt.MapClaims{"role": "not-admin-at-all"})
+	if err != nil || got {
+		t.Errorf("role fragment: got (%v, %v), want (false, nil)", got, err)
+	}
+}
+
+func TestSubstringExpr(t *testing.T) {
+	t.Parallel()
+
+	claims := sampleClaims()
+
+	got, err := Substring("name", "Jane").Evaluate(claims)
 	if err != nil || !got {
 		t.Errorf("substring match: got (%v, %v), want (true, nil)", got, err)
 	}
 
-	got, err = Contains("name", "Bob").Evaluate(claims)
+	got, err = Substring("name", "Bob").Evaluate(claims)
 	if err != nil || got {
 		t.Errorf("substring miss: got (%v, %v), want (false, nil)", got, err)
+	}
+
+	// Array claims match when any element contains the value.
+	got, err = Substring("tags", "ol").Evaluate(claims)
+	if err != nil || !got {
+		t.Errorf("array substring match: got (%v, %v), want (true, nil)", got, err)
 	}
 }
 
@@ -340,8 +372,11 @@ func TestParseExpression_LeafFunctions(t *testing.T) {
 		{"Equals matches", "Equals(`role`, `admin`)", true},
 		{"Equals miss", "Equals(`role`, `guest`)", false},
 		{"Prefix matches", "Prefix(`role`, `adm`)", true},
-		{"Contains substring", "Contains(`name`, `Jane`)", true},
+		{"Contains equality", "Contains(`name`, `Jane Doe`)", true},
+		{"Contains is not substring", "Contains(`name`, `Jane`)", false},
 		{"Contains array membership", "Contains(`tags`, `vip`, `gold`)", true},
+		{"Substring matches", "Substring(`name`, `Jane`)", true},
+		{"Substring miss", "Substring(`name`, `Bob`)", false},
 		{"OneOf matches", "OneOf(`role`, `admin`, `owner`)", true},
 		{"OneOf miss", "OneOf(`role`, `guest`, `viewer`)", false},
 	}
@@ -426,6 +461,101 @@ func TestParseExpression_SyntaxErrors(t *testing.T) {
 			t.Parallel()
 			if _, err := ParseExpression(expr); err == nil {
 				t.Errorf("ParseExpression(%q) expected error, got nil", expr)
+			}
+		})
+	}
+}
+
+// TestParseExpression_RejectsTrailingInput guards against the parser stopping
+// at the first thing it did not recognise and returning only what came before:
+// "and" for "&&", or a single "&", silently dropped the rest of the expression
+// and granted access on the first call alone.
+func TestParseExpression_RejectsTrailingInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{
+		"Equals(`email_verified`, `true`) and OneOf(`role`, `admin`)",
+		"Equals(`a`,`b`) & Equals(`role`,`admin`)",
+		"Equals(`role`, `admin`) | Equals(`role`, `owner`)",
+		"Equals(`role`, `admin`) Equals(`role`, `guest`)",
+		"Equals(`role`, `admin`))",
+		"OneOf(`role`, `admin`) trailing",
+		"OneOf(`role`, `admin` junk `owner`)",
+		"(Equals(`role`, `admin`)) && Equals(`name`, `Jane Doe`) extra",
+	}
+
+	for _, expr := range tests {
+		t.Run(expr, func(t *testing.T) {
+			t.Parallel()
+			if _, err := ParseExpression(expr); err == nil {
+				t.Errorf("ParseExpression(%q) expected error, got nil", expr)
+			}
+		})
+	}
+}
+
+// TestParseExpression_ValuesContainingParenthesis guards against multi-value
+// functions cutting a backtick-quoted value short at its first ")".
+func TestParseExpression_ValuesContainingParenthesis(t *testing.T) {
+	t.Parallel()
+
+	claims := jwt.MapClaims{
+		"role": "ops (primary)",
+		"tags": []any{"x", "a)b"},
+	}
+
+	tests := []struct {
+		expr string
+		want bool
+	}{
+		{"OneOf(`role`, `ops (primary)`)", true},
+		{"OneOf(`role`, `viewer`, `ops (primary)`)", true},
+		{"OneOf(`role`, `ops (primary)`, `viewer`)", true},
+		{"OneOf(`role`, `ops (secondary)`)", false},
+		{"Contains(`tags`, `a)b`)", true},
+		{"Contains(`tags`, `a)`)", false},
+		{"Substring(`role`, `)`)", true},
+		{"Equals(`role`, `ops (primary)`) && Contains(`tags`, `a)b`, `c`)", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.expr, func(t *testing.T) {
+			t.Parallel()
+			expr, err := ParseExpression(tt.expr)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			got, err := expr.Evaluate(claims)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestClaimsExpressionParseFailureDenies checks that an expression the parser
+// rejects denies the request rather than allowing it.
+func TestClaimsExpressionParseFailureDenies(t *testing.T) {
+	t.Parallel()
+
+	tok, err := GenerateJwtToken(jwtTestSecret, jwt.MapClaims{"role": "admin", "tier": "free"}, time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateJwtToken: %v", err)
+	}
+
+	for _, expr := range []string{
+		"Equals(`role`, `admin`) and Equals(`tier`, `gold`)",
+		"Equals(`role`, `admin`) & Equals(`tier`, `gold`)",
+		"NotAFunction(`role`, `admin`)",
+	} {
+		t.Run(expr, func(t *testing.T) {
+			t.Parallel()
+			auth := &JWTAuth{SigningSecret: jwtTestSecret, ClaimsExpression: expr}
+			if got := serveJWT(auth, tok); got == http.StatusOK {
+				t.Errorf("status = %d for an unparseable expression, want the request denied", got)
 			}
 		})
 	}

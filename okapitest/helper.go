@@ -1,7 +1,7 @@
 /*
  *  MIT License
  *
- * Copyright (c) 2026 Jonas Kaninda
+ * Copyright (c) 2024 Jonas Kaninda
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -24,21 +24,9 @@
 
 package okapitest
 
-import (
-	"encoding/base64"
-	"syscall"
-	"time"
-)
+import "encoding/base64"
 
 func basicAuth(username, password string) string {
 	auth := username + ":" + password
 	return base64.StdEncoding.EncodeToString([]byte(auth))
-}
-func GracefulExitAfter(duration time.Duration) {
-	time.AfterFunc(duration, func() {
-		err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
-		if err != nil {
-			return
-		}
-	})
 }
