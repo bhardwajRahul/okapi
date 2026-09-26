@@ -1,6 +1,6 @@
 # Changes
 
-## Unreleased
+## v1.0.0 - 2026-09-26
 
 ### Security
 
@@ -272,7 +272,7 @@
 - **`JWTAuth.OnUnauthorized` now also runs when no signing key is configured**, where
   the middleware previously answered 401 directly.
 
-## v0.10.0
+## v0.11.0 - 2026-08-08
 
 ### Fixes
 
@@ -291,6 +291,18 @@
 
 ### Breaking Changes
 
+- **The router now uses the native `github.com/jkaninda/njia` API instead of
+  `github.com/jkaninda/njia/muxcompat`.** Routing, path variables, strict-slash redirects and
+  `NotFound`/`MethodNotAllowed` handling are unchanged, so no application code needs to change.
+  The one exception is the already-deprecated `WithMuxRouter` option: its parameter type is now
+  `*njia.Router`, so callers still passing a `*muxcompat.Router` will no longer compile. The
+  option is a no-op in spirit — Okapi manages its own router — and will be removed in a future
+  release.
+
+## v0.10.0 - 2026-07-27
+
+### Breaking Changes
+
 - **The router now uses `github.com/jkaninda/njia/muxcompat` instead of the archived `github.com/gorilla/mux`.**
   `muxcompat` is a drop-in replacement, so routing, path variables, strict-slash redirects and
   `NotFound`/`MethodNotAllowed` handling behave as before and no application code needs to change.
@@ -298,7 +310,7 @@
   `*muxcompat.Router`, so callers still passing a `*mux.Router` will no longer compile. The option is
   a no-op in spirit — Okapi manages its own router — and will be removed in a future release.
 
-## v0.6.2
+## v0.6.2 - 2026-05-27
 
 ### Fixes
 
@@ -309,7 +321,7 @@
   propagating its return value and the caller then wrote a success body, producing two concatenated
   JSON objects in the response. Skipped writes emit a `Debug`-level log to aid troubleshooting.
 
-## v0.6.0
+## v0.6.0 - 2026-05-24
 
 ### Breaking Changes
 
@@ -334,7 +346,7 @@
     - `const` via a new `const:"value"` struct tag,
     - webhooks via the new `(*Okapi).Webhook(name, method, ...Doc options)` API.
 
-## v0.5.0
+## v0.5.0 - 2026-03-14
 
 ### Breaking Changes
 
